@@ -1,10 +1,5 @@
-#include <cstdlib>
 #include <iostream>
 #include <stdarg.h>
-#include <queue>
-#include <chrono>
-#include <unistd.h>
-#include <thread>
 
 #include "options.h"
 #include "program.h"

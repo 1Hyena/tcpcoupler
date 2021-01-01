@@ -2,6 +2,7 @@
 #define TCPHERALD_H_01_01_2021
 
 #include <string>
+#include <limits>
 #include <getopt.h>
 
 class OPTIONS {
