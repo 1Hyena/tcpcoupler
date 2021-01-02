@@ -89,12 +89,12 @@ class OPTIONS {
                     break;
                 }
                 case 'h': {
-                    std::cout << print_usage() << std::endl;
+                    log(nullptr, "%s\n", print_usage().c_str());
                     exit_flag = 1;
                     break;
                 }
                 case 'v':
-                    std::cout << version << std::endl;
+                    log(nullptr, "%s\n", version);
                     exit_flag = 1;
                     break;
                 case '?':
@@ -111,15 +111,19 @@ class OPTIONS {
             int p = atoi(port_str);
 
             if (p <= 0 || p > std::numeric_limits<uint16_t>::max()) {
-                log(logfrom.c_str(), "invalid port number: %s", port_str);
+                log(
+                    logfrom.c_str(), "invalid port number: %s", port_str
+                );
                 return false;
             }
 
             supply_port = uint16_t(p);
         }
         else {
-            std::cout << print_usage() << std::endl;
-            log(logfrom.c_str(), "%s", "missing argument: supply-port");
+            log(nullptr, "%s\n", print_usage().c_str());
+            log(
+                logfrom.c_str(), "%s", "missing argument: supply-port"
+            );
             return false;
         }
 
@@ -128,20 +132,26 @@ class OPTIONS {
             int p = atoi(port_str);
 
             if (p <= 0 || p > std::numeric_limits<uint16_t>::max()) {
-                log(logfrom.c_str(), "invalid port number: %s", port_str);
+                log(
+                    logfrom.c_str(), "invalid port number: %s", port_str
+                );
                 return false;
             }
 
             demand_port = uint16_t(p);
         }
         else {
-            std::cout << print_usage() << std::endl;
-            log(logfrom.c_str(), "%s", "missing argument: demand-port");
+            log(nullptr, "%s\n", print_usage().c_str());
+            log(
+                logfrom.c_str(), "%s", "missing argument: demand-port"
+            );
             return false;
         }
 
         while (optind < argc) {
-            log(logfrom.c_str(), "unidentified argument: %s", argv[optind++]);
+            log(
+                logfrom.c_str(), "unidentified argument: %s", argv[optind++]
+            );
         }
 
         return true;

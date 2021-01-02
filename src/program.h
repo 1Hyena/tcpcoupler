@@ -2,6 +2,7 @@
 #define PROGRAM_H_01_01_2021
 
 #include <string>
+#include <sys/time.h>
 
 class PROGRAM {
     public:
@@ -13,15 +14,17 @@ class PROGRAM {
     , pver(version)
     , status(EXIT_FAILURE)
     , options(nullptr)
-    , max_sys_cmd_len(0) {}
+    , signals(nullptr) {}
 
     ~PROGRAM() {}
 
     static size_t get_log_size();
 
-    static void log(
+    static void print_log(
         const char *, const char *, ...
     ) __attribute__((format(printf, 2, 3)));
+
+    void log(const char *, ...) __attribute__((format(printf, 2, 3)));
 
     void bug(const char * =__builtin_FILE(), int =__builtin_LINE());
     bool init(int argc, char **argv);
@@ -31,20 +34,23 @@ class PROGRAM {
 
     const char *get_name() const;
     const char *get_version() const;
-    const char *get_comment() const;
     uint16_t get_supply_port() const;
     uint16_t get_demand_port() const;
 
     private:
+    void set_alarm(size_t);
+
+    static bool print_text(FILE *fp, const char *text, size_t length);
 
     std::string    pname;
     std::string    pver;
     int            status;
     class OPTIONS *options;
-    std::string    comment;
-    size_t         max_sys_cmd_len;
+    class SIGNALS *signals;
+    struct itimerval timer;
 
     static size_t log_size;
+    static bool   log_time;
 };
 
 #endif
