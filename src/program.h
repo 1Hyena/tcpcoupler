@@ -14,7 +14,8 @@ class PROGRAM {
     , pver(version)
     , status(EXIT_FAILURE)
     , options(nullptr)
-    , signals(nullptr) {}
+    , signals(nullptr)
+    , sockets(nullptr) {}
 
     ~PROGRAM() {}
 
@@ -47,6 +48,7 @@ class PROGRAM {
     int            status;
     class OPTIONS *options;
     class SIGNALS *signals;
+    class SOCKETS *sockets;
     struct itimerval timer;
 
     static size_t log_size;

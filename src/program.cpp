@@ -4,6 +4,7 @@
 #include "options.h"
 #include "program.h"
 #include "signals.h"
+#include "sockets.h"
 
 volatile sig_atomic_t
     SIGNALS::sig_alarm{0},
@@ -24,6 +25,7 @@ void PROGRAM::run() {
     }
 
     log_time = true;
+    sockets->listen("4000");
 
     bool terminated = false;
 
@@ -90,6 +92,13 @@ bool PROGRAM::init(int argc, char **argv) {
         return false;
     }
 
+    sockets = new (std::nothrow) SOCKETS(print_log);
+    if (!sockets) return false;
+
+    if (!sockets->init()) {
+        return false;
+    }
+
     signals->block();
     set_alarm(1);
     setitimer(ITIMER_REAL, &timer, nullptr);
@@ -99,6 +108,16 @@ bool PROGRAM::init(int argc, char **argv) {
 }
 
 int PROGRAM::deinit() {
+    if (sockets) {
+        if (!sockets->deinit()) {
+            status = EXIT_FAILURE;
+            bug();
+        }
+
+        delete sockets;
+        sockets = nullptr;
+    }
+
     if (options) {
         delete options;
         options = nullptr;
