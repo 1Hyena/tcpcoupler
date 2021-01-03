@@ -49,7 +49,6 @@ class PROGRAM {
     class OPTIONS *options;
     class SIGNALS *signals;
     class SOCKETS *sockets;
-    struct itimerval timer;
 
     static size_t log_size;
     static bool   log_time;

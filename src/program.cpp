@@ -26,7 +26,16 @@ void PROGRAM::run() {
 
     bool terminated = false;
 
-    if (sockets->listen("4000") == SOCKETS::NO_DESCRIPTOR) {
+    int supply_descriptor{
+        sockets->listen(std::to_string(get_supply_port()).c_str())
+    };
+
+    int demand_descriptor{
+        sockets->listen(std::to_string(get_demand_port()).c_str())
+    };
+
+    if (supply_descriptor == SOCKETS::NO_DESCRIPTOR
+    ||  demand_descriptor == SOCKETS::NO_DESCRIPTOR) {
         terminated = true;
         status = EXIT_FAILURE;
     }
@@ -36,17 +45,11 @@ void PROGRAM::run() {
     }
 
     do {
-        bool alarmed = false;
-
         signals->block();
         while (int sig = signals->next()) {
             char *sig_name = strsignal(sig);
 
             switch (sig) {
-                case SIGALRM: {
-                    alarmed = true;
-                    break;
-                }
                 case SIGINT :
                 case SIGTERM:
                 case SIGQUIT: terminated = true; // fall through
@@ -65,19 +68,17 @@ void PROGRAM::run() {
         }
         signals->unblock();
 
-        if (alarmed && !terminated) {
+        if (!terminated) {
             log(
                 "Listening on ports %d and %d...",
                 int(get_supply_port()), int(get_demand_port())
             );
 
-            signals->block();
-            set_alarm(1000000);
-            setitimer(ITIMER_REAL, &timer, nullptr);
-            signals->unblock();
+            sockets->wait(supply_descriptor);
+            sockets->wait(demand_descriptor, 1000);
         }
     }
-    while (!terminated && signals->wait_alarm());
+    while (!terminated);
 
     return;
 }
@@ -103,11 +104,6 @@ bool PROGRAM::init(int argc, char **argv) {
     if (!sockets->init()) {
         return false;
     }
-
-    signals->block();
-    set_alarm(1);
-    setitimer(ITIMER_REAL, &timer, nullptr);
-    signals->unblock();
 
     return true;
 }
@@ -275,11 +271,4 @@ uint16_t PROGRAM::get_supply_port() const {
 
 uint16_t PROGRAM::get_demand_port() const {
     return options->demand_port;
-}
-
-void PROGRAM::set_alarm(size_t usec) {
-    timer.it_value.tv_sec     = usec / 1000000;
-    timer.it_value.tv_usec    = usec % 1000000;
-    timer.it_interval.tv_sec  = 0;
-    timer.it_interval.tv_usec = 0;
 }
