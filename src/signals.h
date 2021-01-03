@@ -10,7 +10,7 @@ class SIGNALS {
     public:
     SIGNALS(
         void (*log_fun) (const char *, const char *, ...) =drop_log,
-        const char *log_src ="signals"
+        const char *log_src ="Signals"
     ) : logfrom(log_src)
       , log    (log_fun)
     {}

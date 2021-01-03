@@ -11,7 +11,7 @@ class SOCKETS {
     public:
     SOCKETS(
         void (*log_fun) (const char *, const char *, ...) =drop_log,
-        const char *log_src ="sockets"
+        const char *log_src ="Sockets"
     ) : logfrom(log_src)
       , log    (log_fun)
     {}

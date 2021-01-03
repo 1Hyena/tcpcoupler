@@ -11,7 +11,7 @@ class OPTIONS {
     OPTIONS(
         const char *version,
         void      (*log_fun) (const char *, const char *, ...) =drop_log,
-        const char *log_src ="options"
+        const char *log_src ="Options"
     ) : verbose         (      0)
       , exit_flag       (      0)
       , supply_port     (      0)

@@ -24,10 +24,16 @@ void PROGRAM::run() {
         return;
     }
 
-    log_time = true;
-    sockets->listen("4000");
-
     bool terminated = false;
+
+    if (sockets->listen("4000") == SOCKETS::NO_DESCRIPTOR) {
+        terminated = true;
+        status = EXIT_FAILURE;
+    }
+    else {
+        status = EXIT_SUCCESS;
+        log_time = true;
+    }
 
     do {
         bool alarmed = false;
@@ -73,7 +79,6 @@ void PROGRAM::run() {
     }
     while (!terminated && signals->wait_alarm());
 
-    status = EXIT_SUCCESS;
     return;
 }
 
