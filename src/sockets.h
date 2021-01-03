@@ -125,10 +125,204 @@ class SOCKETS {
     private:
     static void drop_log(const char *, const char *, ...) {}
 
+    inline void handle_series(
+        int epoll_descriptor, epoll_event *event,
+        std::vector<std::pair<int, int>> **series
+    ) {
+        std::vector<std::pair<int, int>> &buffer = **series;
+
+        for (size_t j=0, ssz=buffer.size(); j<ssz;) {
+            bool done = handle_descriptor(
+                epoll_descriptor, event, buffer[j].first, buffer[j].second
+            );
+
+            if (!is_epoll_descriptor(epoll_descriptor)) {
+                // As a result of handling the last descriptor, the epoll
+                // descriptor was closed and cleared. This means that there is
+                // no reason to continue handling descriptors from this epoll
+                // series. In fact, doing so would cause undefined behavior due
+                // to the fact that series vector has been deallocated.
+
+                *series = nullptr;
+                return;
+            }
+
+            if (done) {
+                buffer[j] = buffer.back();
+                buffer.pop_back();
+                --ssz;
+            }
+            else ++j;
+        }
+    }
+
+    inline bool handle_descriptor(
+        int epoll_descriptor, epoll_event *event, int descriptor, int argument
+    ) {
+        log(logfrom.c_str(),"%d: %d %d", epoll_descriptor, descriptor, argument);
+
+        if (descriptor == NO_DESCRIPTOR) {
+            if (argument == NO_DESCRIPTOR) {
+                return true;
+            }
+
+            // Special case for closing the descriptor.
+            if (!close_and_clear(argument)) {
+                pop(argument);
+            }
+
+            return true;
+        }
+
+        if (argument == NO_DESCRIPTOR) {
+            // New incoming connection detected.
+
+            struct sockaddr in_addr;
+            char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
+            socklen_t in_len = sizeof(in_addr);
+
+            int client_descriptor{
+                accept4(
+                    descriptor, &in_addr, &in_len, SOCK_CLOEXEC|SOCK_NONBLOCK
+                )
+            };
+
+            if (client_descriptor < 0) {
+                if (client_descriptor == -1) {
+                    int code = errno;
+
+                    if (code != EAGAIN && code != EWOULDBLOCK) {
+                        log(
+                            logfrom.c_str(), "accept4: %s (%s:%d)",
+                            strerror(code), __FILE__, __LINE__
+                        );
+                    }
+                    else return false;
+                }
+                else {
+                    log(
+                        logfrom.c_str(),
+                        "accept4: unexpected return value %d (%s:%d)",
+                        client_descriptor, __FILE__, __LINE__
+                    );
+                }
+
+                return true;
+            }
+
+            size_t client_descriptor_key{
+                client_descriptor % descriptors.size()
+            };
+
+            descriptors[client_descriptor_key].emplace_back(
+                client_descriptor, int(descriptor)
+            );
+
+            int retval = getnameinfo(
+                &in_addr, in_len, hbuf, sizeof(hbuf), sbuf, sizeof(sbuf),
+                NI_NUMERICHOST|NI_NUMERICSERV
+            );
+
+            if (retval != 0) {
+                log(
+                    logfrom.c_str(), "getnameinfo: %s (%s:%d)",
+                    gai_strerror(retval), __FILE__, __LINE__
+                );
+            }
+            else {
+                log(
+                    logfrom.c_str(), "New connection %d from %s:%s.",
+                    client_descriptor, hbuf, sbuf
+                );
+            }
+
+            event->data.fd = client_descriptor;
+            event->events = EPOLLIN|EPOLLET;
+
+            retval = epoll_ctl(
+                epoll_descriptor, EPOLL_CTL_ADD, client_descriptor, event
+            );
+
+            if (retval != 0) {
+                if (retval == -1) {
+                    int code = errno;
+
+                    log(
+                        logfrom.c_str(), "epoll_ctl: %s (%s:%d)",
+                        strerror(code), __FILE__, __LINE__
+                    );
+                }
+                else {
+                    log(
+                        logfrom.c_str(),
+                        "epoll_ctl: unexpected return value %d (%s:%d)",
+                        retval, __FILE__, __LINE__
+                    );
+                }
+
+                if (!close_and_clear(client_descriptor)) {
+                    pop(client_descriptor);
+                }
+            }
+
+            return true;
+        }
+
+        // New data available to be read.
+
+        log(
+            logfrom.c_str(),
+            "New incoming data on descriptor %d (%s:%d)", descriptor,
+            __FILE__, __LINE__
+        );
+
+        // We have data on the client descriptor waiting to be read.
+        // We must read whatever data is available completely, as we are
+        // running in edge-triggered mode and won't get a notification again
+        // for the same data.
+
+        return read_incoming_bytes(descriptor);
+    }
+
     inline void wait(
         int epoll_descriptor, epoll_event *event, epoll_event *events, int len,
         int timeout =0
     ) {
+        size_t epoll_key = epoll_descriptor % epoll_series.size();
+        std::vector<std::pair<int, int>> *series = nullptr;
+
+        for (size_t i=0, sz=epoll_series[epoll_key].size(); i<sz; ++i) {
+            if (epoll_series[epoll_key][i].first != epoll_descriptor) {
+                continue;
+            }
+
+            series = &(epoll_series[epoll_key][i].second);
+            break;
+        }
+
+        if (series) {
+            if (!series->empty()) {
+                handle_series(epoll_descriptor, event, &series);
+            }
+        }
+        else {
+            log(
+                logfrom.c_str(),
+                "epoll series of descriptor %d could not be found (%s:%d)",
+                epoll_descriptor, __FILE__, __LINE__
+            );
+        }
+
+        if (!series || !series->empty()) {
+            struct timespec ts;
+            ts.tv_sec  = timeout / 1000;
+            ts.tv_nsec = (timeout % 1000) * 1000000;
+
+            pselect(0, nullptr, nullptr, nullptr, &ts, &sigset_none);
+
+            return;
+        }
+
         int pending = epoll_pwait(
             epoll_descriptor, events, len, timeout, &sigset_none
         );
@@ -192,8 +386,7 @@ class SOCKETS {
                         &&  get(d).second != NO_DESCRIPTOR) {
                             log(
                                 logfrom.c_str(),
-                                "Client of descriptor %d disconnected.", d,
-                                __FILE__, __LINE__
+                                "Client of descriptor %d disconnected.", d
                             );
                         }
                         else {
@@ -213,114 +406,70 @@ class SOCKETS {
                     );
                 }
 
-                if (!close_and_clear(d)) {
-                    pop(d);
-                }
+                series->emplace_back(NO_DESCRIPTOR, d);
 
                 continue;
             }
 
-            if (get(d).second == NO_DESCRIPTOR) {
-                // New incoming connection detected.
+            series->emplace_back(d, get(d).second);
+        }
 
-                struct sockaddr in_addr;
-                char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
-                socklen_t in_len = sizeof(in_addr);
+        handle_series(epoll_descriptor, event, &series);
+    }
 
-                int client_descriptor{
-                    accept4(d, &in_addr, &in_len, SOCK_CLOEXEC|SOCK_NONBLOCK)
-                };
+    inline bool read_incoming_bytes(int descriptor) {
+        while (1) {
+            ssize_t count;
+            char buf[65536];
 
-                if (client_descriptor < 0) {
-                    if (client_descriptor == -1) {
-                        int code = errno;
+            count = ::read(descriptor, buf, sizeof(buf));
+            if (count < 0) {
+                if (count == -1) {
+                    int code = errno;
 
-                        if (code != EAGAIN && code != EWOULDBLOCK) {
-                            log(
-                                logfrom.c_str(), "accept4: %s (%s:%d)",
-                                strerror(code), __FILE__, __LINE__
-                            );
-                        }
-                    }
-                    else {
-                        log(
-                            logfrom.c_str(),
-                            "accept4: unexpected return value %d (%s:%d)",
-                            client_descriptor, __FILE__, __LINE__
-                        );
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        return true;
                     }
 
-                    continue;
-                }
-
-                size_t client_descriptor_key{
-                    client_descriptor % descriptors.size()
-                };
-
-                descriptors[client_descriptor_key].emplace_back(
-                    client_descriptor, int(d)
-                );
-
-                int retval = getnameinfo(
-                    &in_addr, in_len, hbuf, sizeof(hbuf), sbuf, sizeof(sbuf),
-                    NI_NUMERICHOST|NI_NUMERICSERV
-                );
-
-                if (retval != 0) {
                     log(
-                        logfrom.c_str(), "getnameinfo: %s (%s:%d)",
-                        gai_strerror(retval), __FILE__, __LINE__
+                        logfrom.c_str(), "read(%d, ?, %lu): %s (%s:%d)",
+                        descriptor, sizeof(buf), strerror(code),
+                        __FILE__, __LINE__
                     );
+
+                    break;
                 }
-                else {
-                    log(
-                        logfrom.c_str(),
-                        "New connection %d from %s:%s.",
-                        client_descriptor, hbuf, sbuf
-                    );
-                }
-
-                event->data.fd = client_descriptor;
-                event->events = EPOLLIN|EPOLLET;
-
-                retval = epoll_ctl(
-                    epoll_descriptor, EPOLL_CTL_ADD, client_descriptor, event
-                );
-
-                if (retval != 0) {
-                    if (retval == -1) {
-                        int code = errno;
-
-                        log(
-                            logfrom.c_str(), "epoll_ctl: %s (%s:%d)",
-                            strerror(code), __FILE__, __LINE__
-                        );
-                    }
-                    else {
-                        log(
-                            logfrom.c_str(),
-                            "epoll_ctl: unexpected return value %d (%s:%d)",
-                            retval, __FILE__, __LINE__
-                        );
-                    }
-
-                    if (!close_and_clear(client_descriptor)) {
-                        pop(client_descriptor);
-                    }
-
-                    continue;
-                }
-            }
-            else {
-                // New data available to be read.
 
                 log(
                     logfrom.c_str(),
-                    "New incoming data on descriptor %d (%s:%d)", d,
+                    "read(%d, ?, %lu): unexpected return value %lld (%s:%d)",
+                    descriptor, sizeof(buf), (long long)(count),
                     __FILE__, __LINE__
                 );
+
+                break;
             }
+            else if (count == 0) {
+                // End of file. The remote has closed the connection.
+                break;
+            }
+
+            log(
+                logfrom.c_str(), "%lld bytes were read from descriptor %d",
+                (long long) count, descriptor
+            );
+
+            // Process buf here.
+            return false;
         }
+
+        // Closing the descriptor will make epoll remove it from the set of
+        // descriptors which are monitored.
+        if (!close_and_clear(descriptor)) {
+            pop(descriptor);
+        }
+
+        return true;
     }
 
     inline int listen(const char *port, int family, int ai_flags =AI_PASSIVE) {
@@ -395,6 +544,12 @@ class SOCKETS {
 
         descriptors[descriptor_key].emplace_back(
             epoll_descriptor, descriptor
+        );
+
+        size_t epoll_series_key = epoll_descriptor % epoll_series.size();
+
+        epoll_series[epoll_series_key].emplace_back(
+            epoll_descriptor, std::vector<std::pair<int,int>>()
         );
 
         size_t epoll_event_key = epoll_descriptor % epoll_events.size();
@@ -738,8 +893,59 @@ class SOCKETS {
 
             if (d.first != descriptor) continue;
 
+            // When removing a descriptor we must be sure to purge it from the
+            // epoll series immediately. Otherwise it may happen that a new
+            // connection is accepted with the same descriptor number and as a
+            // result it would be wrongly assigned the epoll series from the
+            // deleted descriptor.
+
+            for (size_t j=0, j_lim=epoll_series.size(); j<j_lim; ++j) {
+                for (size_t k=0, k_lim=epoll_series[j].size(); k<k_lim; ++k) {
+                    size_t l_lim = epoll_series[j][k].second.size();
+                    for (size_t l=0; l<l_lim; ++l) {
+                        std::pair<int, int> &p = epoll_series[j][k].second[l];
+
+                        if (p.first == NO_DESCRIPTOR) {
+                            if (p.second == descriptor) {
+                                p.second = NO_DESCRIPTOR;
+                            }
+                        }
+                        else if (p.first == descriptor) {
+                            p.first = NO_DESCRIPTOR;
+                            p.second = NO_DESCRIPTOR;
+                        }
+                        else if (p.second == descriptor){
+                            // Since we are purging a parent of some other
+                            // descriptor right now, it is safe to assume that
+                            // this other descriptor is also going to be purged
+                            // and thus its epoll series are irrelevant.
+
+                            p.first = NO_DESCRIPTOR;
+                            p.second = NO_DESCRIPTOR;
+                        }
+                    }
+                }
+            }
+
             descriptors[key_hash][i] = descriptors[key_hash].back();
             descriptors[key_hash].pop_back();
+
+            size_t series_key = descriptor % epoll_series.size();
+            for (size_t j=0, esz=epoll_series[series_key].size(); j<esz; ++j) {
+                auto &series = epoll_series[series_key][j];
+
+                if (series.first != descriptor) continue;
+
+                epoll_series[series_key][j].first = (
+                    epoll_series[series_key].back().first
+                );
+                epoll_series[series_key][j].second.swap(
+                    epoll_series[series_key].back().second
+                );
+                epoll_series[series_key].pop_back();
+
+                break;
+            }
 
             size_t event_key = descriptor % epoll_events.size();
             for (size_t j=0, esz=epoll_events[event_key].size(); j<esz; ++j) {
@@ -791,16 +997,44 @@ class SOCKETS {
         return 0;
     }
 
+    inline bool is_epoll_descriptor(int descriptor) {
+        if (descriptor == NO_DESCRIPTOR) return false;
+
+        size_t key = descriptor % epoll_series.size();
+
+        for (size_t i=0, sz=epoll_series[key].size(); i<sz; ++i) {
+            if (epoll_series[key][i].first == descriptor) return true;
+        }
+
+        return false;
+    }
+
     std::string logfrom;
     void (*log)(const char *, const char *p_fmt, ...);
     std::array<
         std::vector<
             std::pair<
-                int, std::array<epoll_event, 1+EPOLL_MAX_EVENTS> *
+                int, // epoll descriptor
+                std::array<epoll_event, 1+EPOLL_MAX_EVENTS> *
             >
         >, 1024
     > epoll_events;
-    std::array<std::vector<std::pair<int, int>>, 1024> descriptors;
+    std::array<
+        std::vector<
+            std::pair<
+                int, // epoll descriptor
+                std::vector<
+                    std::pair<
+                        int, // child descriptor
+                        int  // parent descriptor
+                    >
+                >
+            >
+        >, 1024
+    > epoll_series;
+    std::array<std::vector<std::pair<int,int>>, 1024> descriptors;
+    std::array<std::vector<std::pair<int,std::vector<uint8_t>>>, 1024> incoming;
+    std::array<std::vector<std::pair<int,std::vector<uint8_t>>>, 1024> outgoing;
     sigset_t sigset_all;
     sigset_t sigset_none;
     sigset_t sigset_orig;
