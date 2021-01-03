@@ -3,6 +3,7 @@
 
 #include <array>
 #include <vector>
+#include <algorithm>
 #include <netdb.h>
 #include <sys/epoll.h>
 
@@ -17,19 +18,45 @@ class SOCKETS {
     ~SOCKETS() {}
 
     static const int EPOLL_MAX_EVENTS = 64;
+    static const int NO_DESCRIPTOR = -1;
 
     inline bool init() {
-        if (sigfillset(&sigset_all) == -1) {
+        int retval = sigfillset(&sigset_all);
+        if (retval == -1) {
+            int code = errno;
+
             log(
-                logfrom.c_str(), "sigfillset failed (%s:%d)", __FILE__, __LINE__
+                logfrom.c_str(), "sigfillset: %s (%s:%d)", strerror(code),
+                __FILE__, __LINE__
+            );
+
+            return false;
+        }
+        else if (retval) {
+            log(
+                logfrom.c_str(),
+                "sigfillset: unexpected return value %d (%s:%d)", retval,
+                __FILE__, __LINE__
             );
 
             return false;
         }
 
-        if (sigemptyset(&sigset_none) == -1) {
+        retval = sigemptyset(&sigset_none);
+        if (retval == -1) {
+            int code = errno;
+
             log(
-                logfrom.c_str(), "sigemptyset failed (%s:%d)",
+                logfrom.c_str(), "sigemptyset: %s (%s:%d)", strerror(code),
+                __FILE__, __LINE__
+            );
+
+            return false;
+        }
+        else if (retval) {
+            log(
+                logfrom.c_str(),
+                "sigemptyset: unexpected return value %d (%s:%d)", retval,
                 __FILE__, __LINE__
             );
 
@@ -40,59 +67,19 @@ class SOCKETS {
     }
 
     inline bool deinit() {
-        // Let's block all signals before calling close because we don't
-        // want it to fail due to getting interrupted by a singal.
-        if (sigprocmask(SIG_SETMASK, &sigset_all, &sigset_orig) == -1) {
-            int code = errno;
-            log(logfrom.c_str(), "sigprocmask: %s", strerror(code));
-            return false;
-        }
-
         bool success = true;
 
         for (size_t key_hash=0; key_hash<descriptors.size(); ++key_hash) {
-            for (size_t i=0, sz=descriptors[key_hash].size(); i<sz; ++i) {
-                const std::pair<int, int> &d = descriptors[key_hash][i];
+            while (!descriptors[key_hash].empty()) {
+                int descriptor = descriptors[key_hash].back().first;
 
-                int descriptor = d.first;
-
-                int retval = close(descriptor);
-
-                if (retval == -1) {
-                    int code = errno;
-                    log(
-                        logfrom.c_str(), "close(%d): %s (%s:%d)",
-                        descriptor, strerror(code), __FILE__, __LINE__
-                    );
+                if (!close_and_clear(descriptor)) {
+                    // If for some reason we couldn't close the descriptor,
+                    // we still need to deallocate the related memmory.
+                    pop(descriptor);
+                    success = false;
                 }
-                else if (retval != 0) {
-                    log(
-                        logfrom.c_str(),
-                        "close(%d): unexpected return value %d (%s:%d)",
-                        descriptor, retval, __FILE__, __LINE__
-                    );
-                }
-                else continue;
-
-                success = false;
             }
-
-            descriptors[key_hash].clear();
-        }
-
-        if (sigprocmask(SIG_SETMASK, &sigset_orig, nullptr) == -1) {
-            int code = errno;
-            log(logfrom.c_str(), "sigprocmask: %s", strerror(code));
-        }
-
-        while (!epoll_events.empty()) {
-            auto &events = epoll_events.back();
-
-            for (size_t i=0; i<events.size(); ++i) {
-                delete events[i];
-            }
-
-            epoll_events.pop_back();
         }
 
         return success;
@@ -120,39 +107,103 @@ class SOCKETS {
     inline int listen(const char *port, int family, int ai_flags =AI_PASSIVE) {
         int descriptor = create_and_bind(port, family, ai_flags);
 
-        if (descriptor == -1) return -1;
+        if (descriptor == NO_DESCRIPTOR) return NO_DESCRIPTOR;
 
-        if (::listen(descriptor, SOMAXCONN) == -1) {
-            int code = errno;
+        int retval = ::listen(descriptor, SOMAXCONN);
+        if (retval != 0) {
+            if (retval == -1) {
+                int code = errno;
 
-            log(
-                logfrom.c_str(), "listen: %s (%s:%d)", strerror(code),
-                __FILE__, __LINE__
-            );
+                log(
+                    logfrom.c_str(), "listen: %s (%s:%d)", strerror(code),
+                    __FILE__, __LINE__
+                );
+            }
+            else {
+                log(
+                    logfrom.c_str(),
+                    "listen: unexpected return value %d (%s:%d)", retval,
+                    __FILE__, __LINE__
+                );
+            }
 
-            safe_close(descriptor);
+            if (!close_and_clear(descriptor)) {
+                pop(descriptor);
+            }
 
-            return -1;
+            return NO_DESCRIPTOR;
         }
 
-        int epoll_descriptor = -1;
+        int epoll_descriptor = create_epoll_and_bind(descriptor);
 
-        if ((epoll_descriptor = epoll_create1(0)) == -1) {
-            int code = errno;
-            log(logfrom.c_str(), "epoll_create1: %s", strerror(code));
+        if (epoll_descriptor == NO_DESCRIPTOR) {
+            if (!close_and_clear(descriptor)) {
+                pop(descriptor);
+            }
 
-            safe_close(descriptor);
-
-            return -1;
+            return NO_DESCRIPTOR;
         }
 
-        size_t epoll_event_index = epoll_events.size();
-        epoll_events.resize(epoll_events.size() + 1);
+        return descriptor;
+    }
 
-        auto &events = epoll_events.back();
+    inline int create_epoll_and_bind(int descriptor) {
+        if (descriptor == NO_DESCRIPTOR) return NO_DESCRIPTOR;
+
+        int epoll_descriptor = epoll_create1(0);
+
+        if (epoll_descriptor < 0) {
+            if (epoll_descriptor == -1) {
+                int code = errno;
+
+                log(
+                    logfrom.c_str(), "epoll_create1: %s (%s:%d)",
+                    strerror(code), __FILE__, __LINE__
+                );
+            }
+            else {
+                log(
+                    logfrom.c_str(),
+                    "epoll_create1: unexpected return value %d (%s:%d)",
+                    epoll_descriptor, __FILE__, __LINE__
+                );
+            }
+
+            return NO_DESCRIPTOR;
+        }
+
+        size_t descriptor_key = epoll_descriptor % descriptors.size();
+
+        descriptors[descriptor_key].emplace_back(
+            epoll_descriptor, descriptor
+        );
+
+        size_t epoll_event_key = epoll_descriptor % epoll_events.size();
+
+        epoll_events[epoll_event_key].emplace_back(
+            epoll_descriptor,
+            std::array<epoll_event*, 1+EPOLL_MAX_EVENTS>{
+                nullptr
+            }
+        );
+
+        auto &events = epoll_events[epoll_event_key].back().second;
 
         for (size_t i=0; i<events.size(); ++i) {
             events[i] = new (std::nothrow) epoll_event;
+
+            if (events[i] == nullptr) {
+                log(
+                    logfrom.c_str(), "new: out of memory (%s:%d)",
+                    __FILE__, __LINE__
+                );
+
+                if (!close_and_clear(epoll_descriptor)) {
+                    pop(epoll_descriptor);
+                }
+
+                return NO_DESCRIPTOR;
+            }
         }
 
         struct epoll_event *event = events[0];
@@ -163,43 +214,32 @@ class SOCKETS {
         int retval{
             epoll_ctl(epoll_descriptor, EPOLL_CTL_ADD, descriptor, event)
         };
-        int code = errno;
 
         if (retval != 0) {
             if (retval == -1) {
-                log(logfrom.c_str(), "epoll_ctl: %s", strerror(code));
-            }
-            else if (retval != 0) {
+                int code = errno;
+
                 log(
-                    logfrom.c_str(), "epoll_ctl: unexpected return value %d",
-                    retval
+                    logfrom.c_str(), "epoll_ctl: %s (%s:%d)", strerror(code),
+                    __FILE__, __LINE__
+                );
+            }
+            else {
+                log(
+                    logfrom.c_str(),
+                    "epoll_ctl: unexpected return value %d (%s:%d)",
+                    retval, __FILE__, __LINE__
                 );
             }
 
-            for (size_t i=0; i<events.size(); ++i) {
-                delete events[i];
+            if (!close_and_clear(epoll_descriptor)) {
+                pop(epoll_descriptor);
             }
 
-            epoll_events.pop_back();
-
-            safe_close(epoll_descriptor);
-            safe_close(descriptor);
-
-            return -1;
+            return NO_DESCRIPTOR;
         }
 
-        size_t descriptor_key = descriptor % descriptors.size();
-        size_t epoll_descriptor_key = epoll_descriptor % descriptors.size();
-
-        descriptors[descriptor_key].emplace_back(descriptor, 0);
-
-        descriptors[epoll_descriptor_key].emplace_back(
-            epoll_descriptor, descriptor
-        );
-
-        epoll_descriptors.emplace_back(epoll_descriptor, epoll_event_index);
-
-        return descriptor;
+        return epoll_descriptor;
     }
 
     inline int create_and_bind(
@@ -221,11 +261,15 @@ class SOCKETS {
         };
         struct addrinfo *info = nullptr;
 
-        int descriptor = -1;
+        int descriptor = NO_DESCRIPTOR;
         int retval = getaddrinfo(nullptr, port, &hint, &info);
 
         if (retval != 0) {
-            log(logfrom.c_str(), "getaddrinfo: %s", gai_strerror(retval));
+            log(
+                logfrom.c_str(), "getaddrinfo: %s (%s:%d)",
+                gai_strerror(retval), __FILE__, __LINE__
+            );
+
             goto CleanUp;
         }
 
@@ -236,7 +280,22 @@ class SOCKETS {
                 next->ai_protocol
             );
 
-            if (descriptor == -1) continue;
+            if (descriptor == -1) {
+                int code = errno;
+
+                log(
+                    logfrom.c_str(), "socket: %s (%s:%d)", strerror(code),
+                    __FILE__, __LINE__
+                );
+
+                continue;
+            }
+
+            size_t descriptor_key = descriptor % descriptors.size();
+
+            descriptors[descriptor_key].emplace_back(
+                descriptor, NO_DESCRIPTOR
+            );
 
             int optval = 1;
             retval = setsockopt(
@@ -244,32 +303,57 @@ class SOCKETS {
                 (const void *) &optval, sizeof(optval)
             );
 
-            if (retval == -1) {
-                log(logfrom.c_str(), "setsockopt: %s", strerror(errno));
+            if (retval != 0) {
+                if (retval == -1) {
+                    int code = errno;
+
+                    log(
+                        logfrom.c_str(), "setsockopt: %s (%s:%d)",
+                        strerror(code), __FILE__, __LINE__
+                    );
+                }
+                else {
+                    log(
+                        logfrom.c_str(),
+                        "setsockopt: unexpected return value %d (%s:%d)",
+                        retval, __FILE__, __LINE__
+                    );
+                }
             }
             else {
                 retval = bind(descriptor, next->ai_addr, next->ai_addrlen);
 
-                if (!retval) break;
-                else if (retval == -1) {
-                    log(logfrom.c_str(), "bind: %s", strerror(errno));
+                if (retval) {
+                    if (retval == -1) {
+                        int code = errno;
+
+                        log(
+                            logfrom.c_str(), "bind: %s (%s:%d)", strerror(code),
+                            __FILE__, __LINE__
+                        );
+                    }
+                    else {
+                        log(
+                            logfrom.c_str(),
+                            "bind(%d, ?, %d) returned %d (%s:%d)",
+                            descriptor, next->ai_addrlen, retval,
+                            __FILE__, __LINE__
+                        );
+                    }
                 }
-                else {
-                    log(
-                        logfrom.c_str(), "bind(%d, ?, %d) returned %d",
-                        descriptor, next->ai_addrlen, retval
-                    );
-                }
+                else break;
             }
 
-            if (!safe_close(descriptor)) {
+            if (!close_and_clear(descriptor)) {
                 log(
                     logfrom.c_str(), "failed to close descriptor %d (%s:%d)",
                     descriptor, __FILE__, __LINE__
                 );
+
+                pop(descriptor);
             }
 
-            descriptor = -1;
+            descriptor = NO_DESCRIPTOR;
         }
 
         CleanUp:
@@ -278,11 +362,10 @@ class SOCKETS {
         return descriptor;
     }
 
-
-    inline size_t safe_close(int descriptor) {
+    inline size_t close_and_clear(int descriptor) {
         // Returns the number of descriptors successfully closed as a result.
 
-        if (descriptor < 0) {
+        if (descriptor == NO_DESCRIPTOR) {
             log(
                 logfrom.c_str(), "unexpected descriptor %d (%s:%d)", descriptor,
                 __FILE__, __LINE__
@@ -293,48 +376,55 @@ class SOCKETS {
 
         // Let's block all signals before calling close because we don't
         // want it to fail due to getting interrupted by a singal.
-        if (sigprocmask(SIG_SETMASK, &sigset_all, &sigset_orig) == -1) {
+        int retval = sigprocmask(SIG_SETMASK, &sigset_all, &sigset_orig);
+        if (retval == -1) {
             int code = errno;
-            log(logfrom.c_str(), "sigprocmask: %s", strerror(code));
+            log(
+                logfrom.c_str(), "sigprocmask: %s (%s:%d)", strerror(code),
+                __FILE__, __LINE__
+            );
+            return 0;
+        }
+        else if (retval) {
+            log(
+                logfrom.c_str(),
+                "sigprocmask: unexpected return value %d (%s:%d)", retval,
+                __FILE__, __LINE__
+            );
+
             return 0;
         }
 
         size_t closed = 0;
-        int retval = close(descriptor);
+        retval = close(descriptor);
 
-        if (retval == -1) {
-            int code = errno;
-            log(
-                logfrom.c_str(), "close(%d): %s (%s:%d)",
-                descriptor, strerror(code), __FILE__, __LINE__
-            );
+        if (retval) {
+            if (retval == -1) {
+                int code = errno;
+
+                log(
+                    logfrom.c_str(), "close(%d): %s (%s:%d)",
+                    descriptor, strerror(code), __FILE__, __LINE__
+                );
+            }
+            else {
+                log(
+                    logfrom.c_str(),
+                    "close(%d): unexpected return value %d (%s:%d)",
+                    descriptor, retval, __FILE__, __LINE__
+                );
+            }
         }
-        else if (retval != 0) {
-            log(
-                logfrom.c_str(), "close(%d): unexpected return value %d",
-                descriptor, retval
-            );
-        }
-        else ++closed;
+        else {
+            ++closed;
 
-        while (retval == 0) {
-            int close_children_of = 0;
-            size_t key_hash = descriptor % descriptors.size();
-            bool found = false;
+            std::pair<int, int> descriptor_data{pop(descriptor)};
+            bool found = descriptor_data.first != NO_DESCRIPTOR;
 
-            for (size_t i=0, sz = descriptors[key_hash].size(); i<sz; ++i) {
-                const std::pair<int, int> &d = descriptors[key_hash][i];
+            int close_children_of = NO_DESCRIPTOR;
 
-                if (d.first != descriptor) continue;
-
-                if (!d.second) {
-                    close_children_of = descriptor;
-                }
-
-                descriptors[key_hash][i] = descriptors[key_hash].back();
-                descriptors[key_hash].pop_back();
-                found = true;
-                break;
+            if (descriptor_data.second == NO_DESCRIPTOR) {
+                close_children_of = descriptor;
             }
 
             if (!found) {
@@ -345,61 +435,140 @@ class SOCKETS {
                 );
             }
 
-            if (!close_children_of) break;
+            if (close_children_of != NO_DESCRIPTOR) {
+                std::vector<int> to_be_closed;
 
-            for (size_t key_hash=0; key_hash<descriptors.size(); ++key_hash) {
-                for (size_t i=0, sz=descriptors[key_hash].size(); i<sz;) {
-                    const std::pair<int, int> &d = descriptors[key_hash][i];
+                for (size_t key=0; key<descriptors.size(); ++key) {
+                    for (size_t i=0, sz=descriptors[key].size(); i<sz; ++i) {
+                        const std::pair<int, int> &d = descriptors[key][i];
 
-                    ++i;
+                        if (d.second != close_children_of) {
+                            continue;
+                        }
 
-                    if (d.second != close_children_of) {
-                        continue;
-                    }
-
-                    retval = close(d.first);
-
-                    if (retval == -1) {
-                        int code = errno;
-                        log(
-                            logfrom.c_str(), "close(%d): %s (%s:%d)", d.first,
-                            strerror(code), __FILE__, __LINE__
-                        );
-                    }
-                    else if (retval != 0) {
-                        log(
-                            logfrom.c_str(),
-                            "close(%d): unexpected return value %d (%s:%d)",
-                            d.first, retval, __FILE__, __LINE__
-                        );
-                    }
-                    else {
-                        descriptors[key_hash][i] = descriptors[key_hash].back();
-                        descriptors[key_hash].pop_back();
-                        --sz;
-                        --i;
-                        ++closed;
+                        to_be_closed.emplace_back(d.first);
                     }
                 }
+
+                std::for_each(
+                    to_be_closed.begin(),
+                    to_be_closed.end(),
+                    [&](int d) {
+                        retval = close(d);
+
+                        if (retval == -1) {
+                            int code = errno;
+                            log(
+                                logfrom.c_str(), "close(%d): %s (%s:%d)", d,
+                                strerror(code), __FILE__, __LINE__
+                            );
+                        }
+                        else if (retval != 0) {
+                            log(
+                                logfrom.c_str(),
+                                "close(%d): unexpected return value %d (%s:%d)",
+                                d, retval, __FILE__, __LINE__
+                            );
+                        }
+                        else {
+                            descriptor_data = pop(d);
+
+                            if (descriptor_data.first == NO_DESCRIPTOR) {
+                                log(
+                                    logfrom.c_str(),
+                                    "descriptor %d closed but not found "
+                                    "(%s:%d)", d, __FILE__, __LINE__
+                                );
+                            }
+
+                            ++closed;
+                        }
+                    }
+                );
             }
-
-            TODO: BE SURE TO CLEAN UP EPOLL EVENTS HERE IF NEEDED
-
-            break;
         }
 
-        if (sigprocmask(SIG_SETMASK, &sigset_orig, nullptr) == -1) {
+        retval = sigprocmask(SIG_SETMASK, &sigset_orig, nullptr);
+        if (retval == -1) {
             int code = errno;
-            log(logfrom.c_str(), "sigprocmask: %s", strerror(code));
+            log(
+                logfrom.c_str(), "sigprocmask: %s (%s:%d)", strerror(code),
+                __FILE__, __LINE__
+            );
+        }
+        else if (retval) {
+            log(
+                logfrom.c_str(),
+                "sigprocmask: unexpected return value %d (%s:%d)", retval,
+                __FILE__, __LINE__
+            );
         }
 
         return closed;
     }
 
+    inline std::pair<int, int> pop(int descriptor) {
+        if (descriptor == NO_DESCRIPTOR) {
+            return std::make_pair(NO_DESCRIPTOR, NO_DESCRIPTOR);
+        }
+
+        size_t key_hash = descriptor % descriptors.size();
+
+        for (size_t i=0, sz=descriptors[key_hash].size(); i<sz; ++i) {
+            const std::pair<int, int> &d = descriptors[key_hash][i];
+
+            if (d.first != descriptor) continue;
+
+            descriptors[key_hash][i] = descriptors[key_hash].back();
+            descriptors[key_hash].pop_back();
+
+            size_t event_key = descriptor % epoll_events.size();
+            for (size_t j=0, esz=epoll_events[event_key].size(); j<esz; ++j) {
+                auto &ev = epoll_events[event_key][j];
+
+                if (ev.first != descriptor) continue;
+
+                std::for_each(
+                    ev.second.begin(),
+                    ev.second.end(),
+                    [] (epoll_event *evp) {
+                        if (evp) delete evp;
+                    }
+                );
+
+                epoll_events[event_key][j] = epoll_events[event_key].back();
+                epoll_events[event_key].pop_back();
+
+                break;
+            }
+
+            return std::make_pair(d.first, d.second);
+        }
+
+        return std::make_pair(NO_DESCRIPTOR, NO_DESCRIPTOR);
+    }
+
+    inline size_t count(int descriptor) {
+        if (descriptor == NO_DESCRIPTOR) return 0;
+
+        size_t key = descriptor % descriptors.size();
+
+        for (size_t i=0, sz=descriptors[key].size(); i<sz; ++i) {
+            if (descriptors[key][i].first == descriptor) return 1;
+        }
+
+        return 0;
+    }
+
     std::string logfrom;
     void (*log)(const char *, const char *p_fmt, ...);
-    std::vector<std::pair<int, size_t>> epoll_descriptors;
-    std::vector<std::array<epoll_event *, 1+EPOLL_MAX_EVENTS>> epoll_events;
+    std::array<
+        std::vector<
+            std::pair<
+                int, std::array<epoll_event *, 1+EPOLL_MAX_EVENTS>
+            >
+        >, 1024
+    > epoll_events;
     std::array<std::vector<std::pair<int, int>>, 1024> descriptors;
     sigset_t sigset_all;
     sigset_t sigset_none;
