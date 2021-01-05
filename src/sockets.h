@@ -174,7 +174,7 @@ class SOCKETS {
             return true;
         }
 
-        if (argument == NO_DESCRIPTOR) {
+        while (argument == NO_DESCRIPTOR) {
             // New incoming connection detected.
 
             struct sockaddr in_addr;
@@ -191,13 +191,46 @@ class SOCKETS {
                 if (client_descriptor == -1) {
                     int code = errno;
 
-                    if (code != EAGAIN && code != EWOULDBLOCK) {
-                        log(
-                            logfrom.c_str(), "accept4: %s (%s:%d)",
-                            strerror(code), __FILE__, __LINE__
-                        );
+                    switch (code) {
+#if EAGAIN != EWOULDBLOCK
+                        case EAGAIN:
+#endif
+                        case EWOULDBLOCK: {
+                            // Everything is normal.
+
+                            return true;
+                        }
+                        case ENETDOWN:
+                        case EPROTO:
+                        case ENOPROTOOPT:
+                        case EHOSTDOWN:
+                        case ENONET:
+                        case EHOSTUNREACH:
+                        case EOPNOTSUPP:
+                        case ENETUNREACH: {
+                            // These errors are supposed to be temporary.
+
+                            log(
+                                logfrom.c_str(), "accept4: %s (%s:%d)",
+                                strerror(code), __FILE__, __LINE__
+                            );
+
+                            return false;
+                        }
+                        case EINTR: {
+                            return false;
+                        }
+                        default: {
+                            // These errors are fatal.
+
+                            log(
+                                logfrom.c_str(), "accept4: %s (%s:%d)",
+                                strerror(code), __FILE__, __LINE__
+                            );
+
+                            break;
+                        }
                     }
-                    else return false;
                 }
                 else {
                     log(
@@ -205,6 +238,12 @@ class SOCKETS {
                         "accept4: unexpected return value %d (%s:%d)",
                         client_descriptor, __FILE__, __LINE__
                     );
+                }
+
+                // Something has gone terribly wrong.
+
+                if (!close_and_clear(descriptor)) {
+                    pop(descriptor);
                 }
 
                 return true;
@@ -264,8 +303,6 @@ class SOCKETS {
                     pop(client_descriptor);
                 }
             }
-
-            return true;
         }
 
         // New data available to be read.
