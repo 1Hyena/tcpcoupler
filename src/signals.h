@@ -33,6 +33,7 @@ class SIGNALS {
             log(logfrom.c_str(), "sigdelset failed");
             return false;
         }
+
         if (sigemptyset(&sigset_none) == -1) {
             log(logfrom.c_str(), "sigemptyset failed");
             return false;
@@ -112,10 +113,14 @@ class SIGNALS {
         return true;
     }
 
-    inline bool wait_alarm() {
+    inline bool wait_any() {
         sigset_t mask, oldmask;
 
         sigemptyset(&mask);
+        sigaddset(&mask,  SIGINT);
+        sigaddset(&mask, SIGTERM);
+        sigaddset(&mask, SIGQUIT);
+        sigaddset(&mask, SIGPIPE);
         sigaddset(&mask, SIGALRM);
 
         if (sigprocmask(SIG_BLOCK, &mask, &oldmask) == -1) {
@@ -123,7 +128,9 @@ class SIGNALS {
             return false;
         }
 
-        while (!sig_alarm) sigsuspend(&oldmask);
+        while (!sig_alarm && !sig_pipe && !sig_int && !sig_term && !sig_quit) {
+            sigsuspend(&oldmask);
+        }
 
         if (sigprocmask(SIG_UNBLOCK, &mask, nullptr) == -1) {
             log(logfrom.c_str(), "sigprocmask: %s", strerror(errno));

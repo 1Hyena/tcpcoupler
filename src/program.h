@@ -39,8 +39,6 @@ class PROGRAM {
     uint16_t get_demand_port() const;
 
     private:
-    void set_alarm(size_t);
-
     static bool print_text(FILE *fp, const char *text, size_t length);
 
     std::string    pname;
