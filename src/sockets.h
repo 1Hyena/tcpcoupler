@@ -8,6 +8,23 @@
 #include <sys/epoll.h>
 
 class SOCKETS {
+    private:
+    struct record_type {
+        int descriptor;
+        int parent;
+    };
+
+    static constexpr record_type make_record(int descriptor, int parent) {
+        return
+#if __cplusplus <= 201703L
+        __extension__
+#endif
+        record_type{
+            .descriptor = descriptor,
+            .parent     = parent
+        };
+    }
+
     public:
     SOCKETS(
         void (*log_fun) (const char *, const char *, ...) =drop_log,
@@ -71,7 +88,7 @@ class SOCKETS {
 
         for (size_t key_hash=0; key_hash<descriptors.size(); ++key_hash) {
             while (!descriptors[key_hash].empty()) {
-                int descriptor = descriptors[key_hash].back().first;
+                int descriptor = descriptors[key_hash].back().descriptor;
 
                 if (!close_and_clear(descriptor)) {
                     // If for some reason we couldn't close the descriptor,
@@ -106,7 +123,7 @@ class SOCKETS {
             for (size_t j=0, dsz=epoll_events[i].size(); j<dsz; ++j) {
                 int epoll_descriptor = epoll_events[i][j].first;
 
-                if (get(epoll_descriptor).second != descriptor) continue;
+                if (get(epoll_descriptor).parent != descriptor) continue;
 
                 epoll_event *events = &(epoll_events[i][j].second->at(1));
 
@@ -254,7 +271,7 @@ class SOCKETS {
             };
 
             descriptors[client_descriptor_key].emplace_back(
-                client_descriptor, int(descriptor)
+                make_record(client_descriptor, int(descriptor))
             );
 
             int retval = getnameinfo(
@@ -420,7 +437,7 @@ class SOCKETS {
                     }
                     else {
                         if (socket_error == EPIPE
-                        &&  get(d).second != NO_DESCRIPTOR) {
+                        &&  get(d).parent != NO_DESCRIPTOR) {
                             log(
                                 logfrom.c_str(),
                                 "Client of descriptor %d disconnected.", d
@@ -448,7 +465,7 @@ class SOCKETS {
                 continue;
             }
 
-            series->emplace_back(d, get(d).second);
+            series->emplace_back(d, get(d).parent);
         }
 
         handle_series(epoll_descriptor, event, &series);
@@ -580,7 +597,7 @@ class SOCKETS {
         size_t descriptor_key = epoll_descriptor % descriptors.size();
 
         descriptors[descriptor_key].emplace_back(
-            epoll_descriptor, descriptor
+            make_record(epoll_descriptor, descriptor)
         );
 
         size_t epoll_series_key = epoll_descriptor % epoll_series.size();
@@ -699,7 +716,7 @@ class SOCKETS {
             size_t descriptor_key = descriptor % descriptors.size();
 
             descriptors[descriptor_key].emplace_back(
-                descriptor, NO_DESCRIPTOR
+                make_record(descriptor, NO_DESCRIPTOR)
             );
 
             int optval = 1;
@@ -826,12 +843,12 @@ class SOCKETS {
                 logfrom.c_str(), "Closed descriptor %d.", descriptor
             );
 
-            std::pair<int, int> descriptor_data{pop(descriptor)};
-            bool found = descriptor_data.first != NO_DESCRIPTOR;
+            record_type record{pop(descriptor)};
+            bool found = record.descriptor != NO_DESCRIPTOR;
 
             int close_children_of = NO_DESCRIPTOR;
 
-            if (descriptor_data.second == NO_DESCRIPTOR) {
+            if (record.parent == NO_DESCRIPTOR) {
                 close_children_of = descriptor;
             }
 
@@ -848,13 +865,13 @@ class SOCKETS {
 
                 for (size_t key=0; key<descriptors.size(); ++key) {
                     for (size_t i=0, sz=descriptors[key].size(); i<sz; ++i) {
-                        const std::pair<int, int> &d = descriptors[key][i];
+                        const record_type &rec = descriptors[key][i];
 
-                        if (d.second != close_children_of) {
+                        if (rec.parent != close_children_of) {
                             continue;
                         }
 
-                        to_be_closed.emplace_back(d.first);
+                        to_be_closed.emplace_back(rec.descriptor);
                     }
                 }
 
@@ -879,9 +896,9 @@ class SOCKETS {
                             );
                         }
                         else {
-                            descriptor_data = pop(d);
+                            record = pop(d);
 
-                            if (descriptor_data.first == NO_DESCRIPTOR) {
+                            if (record.descriptor == NO_DESCRIPTOR) {
                                 log(
                                     logfrom.c_str(),
                                     "descriptor %d closed but not found "
@@ -918,17 +935,17 @@ class SOCKETS {
         return closed;
     }
 
-    inline std::pair<int, int> pop(int descriptor) {
+    inline record_type pop(int descriptor) {
         if (descriptor == NO_DESCRIPTOR) {
-            return std::make_pair(NO_DESCRIPTOR, NO_DESCRIPTOR);
+            return make_record(NO_DESCRIPTOR, NO_DESCRIPTOR);
         }
 
         size_t key_hash = descriptor % descriptors.size();
 
         for (size_t i=0, sz=descriptors[key_hash].size(); i<sz; ++i) {
-            const std::pair<int, int> &d = descriptors[key_hash][i];
+            const record_type &rec = descriptors[key_hash][i];
 
-            if (d.first != descriptor) continue;
+            if (rec.descriptor != descriptor) continue;
 
             // When removing a descriptor we must be sure to purge it from the
             // epoll series immediately. Otherwise it may happen that a new
@@ -998,28 +1015,28 @@ class SOCKETS {
                 break;
             }
 
-            return std::make_pair(d.first, d.second);
+            return make_record(rec.descriptor, rec.parent);
         }
 
-        return std::make_pair(NO_DESCRIPTOR, NO_DESCRIPTOR);
+        return make_record(NO_DESCRIPTOR, NO_DESCRIPTOR);
     }
 
-    inline std::pair<int, int> get(int descriptor) {
+    inline record_type get(int descriptor) {
         if (descriptor == NO_DESCRIPTOR) {
-            return std::make_pair(NO_DESCRIPTOR, NO_DESCRIPTOR);
+            return make_record(NO_DESCRIPTOR, NO_DESCRIPTOR);
         }
 
         size_t key_hash = descriptor % descriptors.size();
 
         for (size_t i=0, sz=descriptors[key_hash].size(); i<sz; ++i) {
-            const std::pair<int, int> &d = descriptors[key_hash][i];
+            const record_type &rec = descriptors[key_hash][i];
 
-            if (d.first != descriptor) continue;
+            if (rec.descriptor != descriptor) continue;
 
-            return std::make_pair(d.first, d.second);
+            return rec;
         }
 
-        return std::make_pair(NO_DESCRIPTOR, NO_DESCRIPTOR);
+        return make_record(NO_DESCRIPTOR, NO_DESCRIPTOR);
     }
 
     inline size_t count(int descriptor) {
@@ -1028,7 +1045,7 @@ class SOCKETS {
         size_t key = descriptor % descriptors.size();
 
         for (size_t i=0, sz=descriptors[key].size(); i<sz; ++i) {
-            if (descriptors[key][i].first == descriptor) return 1;
+            if (descriptors[key][i].descriptor == descriptor) return 1;
         }
 
         return 0;
@@ -1069,7 +1086,7 @@ class SOCKETS {
             >
         >, 1024
     > epoll_series;
-    std::array<std::vector<std::pair<int,int>>, 1024> descriptors;
+    std::array<std::vector<record_type>, 1024> descriptors;
     std::array<std::vector<std::pair<int,std::vector<uint8_t>>>, 1024> incoming;
     std::array<std::vector<std::pair<int,std::vector<uint8_t>>>, 1024> outgoing;
     sigset_t sigset_all;
