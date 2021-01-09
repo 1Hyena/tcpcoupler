@@ -74,8 +74,12 @@ void PROGRAM::run() {
                 int(get_supply_port()), int(get_demand_port())
             );
 
-            sockets->wait(supply_descriptor);
-            sockets->wait(demand_descriptor, 1000);
+            if (!sockets->serve(supply_descriptor)
+            ||  !sockets->serve(demand_descriptor, 1000)) {
+                log("%s", "Error while serving the listening descriptors.");
+                status = EXIT_FAILURE;
+                terminated = true;
+            }
         }
     }
     while (!terminated);
