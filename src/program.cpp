@@ -42,6 +42,11 @@ void PROGRAM::run() {
     else {
         status = EXIT_SUCCESS;
         log_time = true;
+
+        log(
+            "Listening on ports %d and %d...",
+            int(get_supply_port()), int(get_demand_port())
+        );
     }
 
     do {
@@ -68,18 +73,28 @@ void PROGRAM::run() {
         }
         signals->unblock();
 
-        if (!terminated) {
-            log(
-                "Listening on ports %d and %d...",
-                int(get_supply_port()), int(get_demand_port())
-            );
+        if (terminated) continue;
 
-            if (!sockets->serve(supply_descriptor)
-            ||  !sockets->serve(demand_descriptor, 1000)) {
-                log("%s", "Error while serving the listening descriptors.");
-                status = EXIT_FAILURE;
-                terminated = true;
-            }
+        if (!sockets->serve(supply_descriptor)
+        ||  !sockets->serve(demand_descriptor, 1000)) {
+            log("%s", "Error while serving the listening descriptors.");
+            status = EXIT_FAILURE;
+            terminated = true;
+        }
+
+        int d = SOCKETS::NO_DESCRIPTOR;
+        while ((d = sockets->next_disconnection()) != SOCKETS::NO_DESCRIPTOR) {
+            log(
+                "Disconnection from descriptor %d (%s:%s).", d,
+                sockets->get_host(d), sockets->get_port(d)
+            );
+        }
+
+        while ((d = sockets->next_connection()) != SOCKETS::NO_DESCRIPTOR) {
+            log(
+                "New connection from descriptor %d (%s:%s).", d,
+                sockets->get_host(d), sockets->get_port(d)
+            );
         }
     }
     while (!terminated);

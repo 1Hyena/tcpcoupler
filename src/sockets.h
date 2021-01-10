@@ -18,14 +18,18 @@ class SOCKETS {
         READ      = 2,
         WRITE     = 3,
         ACCEPT    = 4,
-        CLOSE     = 5,
-        MAX_FLAGS = 6
+        CONNECT   = 5,
+        DISCONNECT= 6,
+        CLOSE     = 7,
+        MAX_FLAGS = 8
     };
 
     private:
     struct record_type {
         std::array<uint32_t, static_cast<size_t>(FLAG::MAX_FLAGS)> flags;
         epoll_event *events;
+        std::array<char, NI_MAXHOST> host;
+        std::array<char, NI_MAXSERV> port;
         int descriptor;
         int parent;
     };
@@ -42,6 +46,8 @@ class SOCKETS {
         record_type record{
             .flags      = {},
             .events     = nullptr,
+            .host       = {'\0'},
+            .port       = {'\0'},
             .descriptor = descriptor,
             .parent     = parent
         };
@@ -156,11 +162,73 @@ class SOCKETS {
         return listen_ipv4(port, exposed);
     }
 
-    inline bool serve(int descriptor, int epoll_timeout =0) {
+    inline int next_connection() {
+        static constexpr const size_t flg_connect_index{
+            static_cast<size_t>(FLAG::CONNECT)
+        };
+
+        if (!flags[flg_connect_index].empty()) {
+            int descriptor = flags[flg_connect_index].back().descriptor;
+            rem_flag(descriptor, FLAG::CONNECT);
+            return descriptor;
+        }
+
+        return NO_DESCRIPTOR;
+    }
+
+    inline int next_disconnection() {
+        static constexpr const size_t flg_disconnect_index{
+            static_cast<size_t>(FLAG::DISCONNECT)
+        };
+
+        if (!flags[flg_disconnect_index].empty()) {
+            int descriptor = flags[flg_disconnect_index].back().descriptor;
+            rem_flag(descriptor, FLAG::DISCONNECT);
+            set_flag(descriptor, FLAG::CLOSE);
+            return descriptor;
+        }
+
+        return NO_DESCRIPTOR;
+    }
+
+    inline const char *get_host(int descriptor) const {
+        const record_type *record = find_record(descriptor);
+        return record ? record->host.data() : "";
+    }
+
+    inline const char *get_port(int descriptor) const {
+        const record_type *record = find_record(descriptor);
+        return record ? record->port.data() : "";
+    }
+
+    inline bool serve(int descriptor, int timeout =0) {
+        static constexpr const size_t flg_connect_index{
+            static_cast<size_t>(FLAG::CONNECT)
+        };
+
+        static constexpr const size_t flg_disconnect_index{
+            static_cast<size_t>(FLAG::DISCONNECT)
+        };
+
+        if (!flags[flg_connect_index].empty()) {
+            // We postpone serving any descriptors until the application has
+            // acknowledged all the new incoming connections.
+
+            struct timespec ts;
+            ts.tv_sec  = timeout / 1000;
+            ts.tv_nsec = (timeout % 1000) * 1000000;
+
+            pselect(0, nullptr, nullptr, nullptr, &ts, &sigset_none);
+
+            return true;
+        }
+
         std::vector<int> recbuf;
 
         for (size_t i=0; i<flags.size(); ++i) {
             FLAG flag = static_cast<FLAG>(i);
+
+            recbuf.reserve(flags[i].size());
 
             for (size_t j=0, sz=flags[i].size(); j<sz; ++j) {
                 int d = flags[i][j].descriptor;
@@ -177,15 +245,39 @@ class SOCKETS {
 
                 switch (flag) {
                     case FLAG::EPOLL: {
-                        if (handle_epoll(d, epoll_timeout)) continue;
+                        if (handle_epoll(d, timeout)) continue;
                         break;
                     }
+                    case FLAG::CONNECT:
+                    case FLAG::DISCONNECT: {
+                        // This descriptor has been marked for acknoledgement
+                        // but the application has not done it yet.
+
+                        set_flag(d, flag);
+                        continue;
+                    }
                     case FLAG::CLOSE: {
+                        if (has_flag(d, FLAG::READ)) {
+                            // We postpone normal closing until there is nothing
+                            // left to read from this descriptor.
+
+                            set_flag(d, FLAG::READ);
+                            continue;
+                        }
+
                         if (handle_close(d)) continue;
                         break;
                     }
                     case FLAG::ACCEPT: {
-                        // TODO: skip this if there sockets were closed recently
+                        if (!flags[flg_disconnect_index].empty()) {
+                            // We postpone the acceptance of new connections
+                            // until all the recent disconnections have been
+                            // acknowledged.
+
+                            set_flag(d, flag);
+                            continue;
+                        }
+
                         if (handle_accept(d)) continue;
                         break;
                     }
@@ -289,15 +381,9 @@ class SOCKETS {
                     else {
                         record_type *rec = find_record(d);
 
-                        if (socket_error == EPIPE
-                        &&  rec
-                        &&  rec->parent != NO_DESCRIPTOR) {
-                            log(
-                                logfrom.c_str(),
-                                "Client of descriptor %d disconnected.", d
-                            );
-                        }
-                        else {
+                        if (socket_error != EPIPE
+                        ||  rec == nullptr
+                        ||  rec->parent == NO_DESCRIPTOR) {
                             log(
                                 logfrom.c_str(),
                                 "epoll error on descriptor %d: %s (%s:%d)", d,
@@ -314,7 +400,7 @@ class SOCKETS {
                     );
                 }
 
-                set_flag(d, FLAG::CLOSE);
+                set_flag(d, FLAG::DISCONNECT);
 
                 continue;
             }
@@ -331,6 +417,56 @@ class SOCKETS {
     }
 
     inline bool handle_read(int descriptor) {
+        while (1) {
+            ssize_t count;
+            char buf[65536];
+
+            count = ::read(descriptor, buf, sizeof(buf));
+            if (count < 0) {
+                if (count == -1) {
+                    int code = errno;
+
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        return true;
+                    }
+
+                    log(
+                        logfrom.c_str(), "read(%d, ?, %lu): %s (%s:%d)",
+                        descriptor, sizeof(buf), strerror(code),
+                        __FILE__, __LINE__
+                    );
+
+                    break;
+                }
+
+                log(
+                    logfrom.c_str(),
+                    "read(%d, ?, %lu): unexpected return value %lld (%s:%d)",
+                    descriptor, sizeof(buf), (long long)(count),
+                    __FILE__, __LINE__
+                );
+
+                break;
+            }
+            else if (count == 0) {
+                // End of file. The remote has closed the connection.
+                break;
+            }
+
+            log(
+                logfrom.c_str(), "%lld bytes were read from descriptor %d",
+                (long long) count, descriptor
+            );
+
+            // Process buf here.
+
+            set_flag(descriptor, FLAG::READ);
+
+            return true;
+        }
+
+        set_flag(descriptor, FLAG::DISCONNECT);
+
         return true;
     }
 
@@ -367,7 +503,6 @@ class SOCKETS {
         }
 
         struct sockaddr in_addr;
-        char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
         socklen_t in_len = sizeof(in_addr);
 
         int client_descriptor{
@@ -450,8 +585,12 @@ class SOCKETS {
             make_record(client_descriptor, int(descriptor))
         );
 
+        record_type *client_record = find_record(client_descriptor);
+
         int retval = getnameinfo(
-            &in_addr, in_len, hbuf, sizeof(hbuf), sbuf, sizeof(sbuf),
+            &in_addr, in_len,
+            client_record->host.data(), socklen_t(client_record->host.size()),
+            client_record->port.data(), socklen_t(client_record->port.size()),
             NI_NUMERICHOST|NI_NUMERICSERV
         );
 
@@ -460,12 +599,9 @@ class SOCKETS {
                 logfrom.c_str(), "getnameinfo: %s (%s:%d)",
                 gai_strerror(retval), __FILE__, __LINE__
             );
-        }
-        else {
-            log(
-                logfrom.c_str(), "New connection %d from %s:%s.",
-                client_descriptor, hbuf, sbuf
-            );
+
+            client_record->host[0] = '\0';
+            client_record->port[0] = '\0';
         }
 
         epoll_event *event = &(epoll_record->events[0]);
@@ -500,57 +636,7 @@ class SOCKETS {
         }
 
         set_flag(descriptor, FLAG::ACCEPT);
-
-        return true;
-    }
-
-    inline bool read_incoming_bytes(int descriptor) {
-        while (1) {
-            ssize_t count;
-            char buf[65536];
-
-            count = ::read(descriptor, buf, sizeof(buf));
-            if (count < 0) {
-                if (count == -1) {
-                    int code = errno;
-
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        return true;
-                    }
-
-                    log(
-                        logfrom.c_str(), "read(%d, ?, %lu): %s (%s:%d)",
-                        descriptor, sizeof(buf), strerror(code),
-                        __FILE__, __LINE__
-                    );
-
-                    break;
-                }
-
-                log(
-                    logfrom.c_str(),
-                    "read(%d, ?, %lu): unexpected return value %lld (%s:%d)",
-                    descriptor, sizeof(buf), (long long)(count),
-                    __FILE__, __LINE__
-                );
-
-                break;
-            }
-            else if (count == 0) {
-                // End of file. The remote has closed the connection.
-                break;
-            }
-
-            log(
-                logfrom.c_str(), "%lld bytes were read from descriptor %d",
-                (long long) count, descriptor
-            );
-
-            // Process buf here.
-            return false;
-        }
-
-        set_flag(descriptor, FLAG::CLOSE);
+        set_flag(client_descriptor, FLAG::CONNECT);
 
         return true;
     }
@@ -861,9 +947,6 @@ class SOCKETS {
         }
         else {
             ++closed;
-            log(
-                logfrom.c_str(), "Closed descriptor %d.", descriptor
-            );
 
             record_type record{pop(descriptor)};
             bool found = record.descriptor != NO_DESCRIPTOR;
@@ -877,8 +960,8 @@ class SOCKETS {
             if (!found) {
                 log(
                     logfrom.c_str(),
-                    "descriptor %d closed but not found (%s:%d)", descriptor,
-                    __FILE__, __LINE__
+                    "descriptor %d closed but record not found (%s:%d)",
+                    descriptor, __FILE__, __LINE__
                 );
             }
 
@@ -923,15 +1006,12 @@ class SOCKETS {
                             if (record.descriptor == NO_DESCRIPTOR) {
                                 log(
                                     logfrom.c_str(),
-                                    "descriptor %d closed but not found "
+                                    "descriptor %d closed but record not found "
                                     "(%s:%d)", d, __FILE__, __LINE__
                                 );
                             }
 
                             ++closed;
-                            log(
-                                logfrom.c_str(), "Closed descriptor %d.", d
-                            );
                         }
                     }
                 );
@@ -991,15 +1071,22 @@ class SOCKETS {
         return make_record(NO_DESCRIPTOR, NO_DESCRIPTOR);
     }
 
-    inline record_type *find_record(int descriptor) {
+    inline const record_type *find_record(int descriptor) const {
         size_t key = descriptor % descriptors.size();
-        for (size_t i=0, sz=descriptors[key].size(); i<sz; ++i) {
-            if (descriptors[key][i].descriptor != descriptor) continue;
 
-            return &(descriptors[key][i]);
+        for (size_t i=0, sz=descriptors.at(key).size(); i<sz; ++i) {
+            if (descriptors.at(key).at(i).descriptor != descriptor) continue;
+
+            return &(descriptors.at(key).at(i));
         }
 
         return nullptr;
+    }
+
+    inline record_type *find_record(int descriptor) {
+        return const_cast<record_type *>(
+            static_cast<const SOCKETS &>(*this).find_record(descriptor)
+        );
     }
 
     inline bool is_listener(int descriptor) {
@@ -1062,6 +1149,26 @@ class SOCKETS {
         }
 
         return true;
+    }
+
+    bool has_flag(int descriptor, FLAG flag) {
+        size_t index = static_cast<size_t>(flag);
+
+        if (index > flags.size()) {
+            return false;
+        }
+
+        record_type *rec = find_record(descriptor);
+
+        if (!rec) return false;
+
+        uint32_t pos = rec->flags[index];
+
+        if (pos != std::numeric_limits<uint32_t>::max()) {
+            return true;
+        }
+
+        return false;
     }
 
     std::string logfrom;
