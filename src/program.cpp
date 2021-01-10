@@ -1,5 +1,7 @@
 #include <iostream>
 #include <stdarg.h>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "options.h"
 #include "program.h"
@@ -49,6 +51,12 @@ void PROGRAM::run() {
         );
     }
 
+    std::vector<uint8_t> buffer;
+    std::unordered_map<int, int> supply_map;
+    std::unordered_map<int, int> demand_map;
+    std::unordered_set<int> unmet_supply;
+    std::unordered_set<int> unmet_demand;
+
     do {
         signals->block();
         while (int sig = signals->next()) {
@@ -76,7 +84,7 @@ void PROGRAM::run() {
         if (terminated) continue;
 
         if (!sockets->serve(supply_descriptor)
-        ||  !sockets->serve(demand_descriptor, 1000)) {
+        ||  !sockets->serve(demand_descriptor, 125)) {
             log("%s", "Error while serving the listening descriptors.");
             status = EXIT_FAILURE;
             terminated = true;
@@ -85,16 +93,102 @@ void PROGRAM::run() {
         int d = SOCKETS::NO_DESCRIPTOR;
         while ((d = sockets->next_disconnection()) != SOCKETS::NO_DESCRIPTOR) {
             log(
-                "Disconnection from descriptor %d (%s:%s).", d,
-                sockets->get_host(d), sockets->get_port(d)
+                "Disconnected %s:%s (descriptor %d).",
+                sockets->get_host(d), sockets->get_port(d), d
             );
+
+            int other_descriptor = SOCKETS::NO_DESCRIPTOR;
+
+            if (supply_map.count(d)) {
+                other_descriptor = supply_map[d];
+                supply_map.erase(d);
+            }
+            else if (demand_map.count(d)) {
+                other_descriptor = demand_map[d];
+                demand_map.erase(d);
+            }
+            else {
+                unmet_supply.erase(d);
+                unmet_demand.erase(d);
+            }
+
+            if (other_descriptor != SOCKETS::NO_DESCRIPTOR) {
+                if (supply_map.count(other_descriptor)) {
+                    supply_map[other_descriptor] = SOCKETS::NO_DESCRIPTOR;
+                }
+                else if (demand_map.count(other_descriptor)) {
+                    demand_map[other_descriptor] = SOCKETS::NO_DESCRIPTOR;
+                }
+
+                sockets->disconnect(other_descriptor);
+            }
         }
 
         while ((d = sockets->next_connection()) != SOCKETS::NO_DESCRIPTOR) {
             log(
-                "New connection from descriptor %d (%s:%s).", d,
-                sockets->get_host(d), sockets->get_port(d)
+                "New connection from %s:%s (descriptor %d).",
+                sockets->get_host(d), sockets->get_port(d), d
             );
+
+            int listener = sockets->get_listener(d);
+
+            if (listener == supply_descriptor) {
+                if (unmet_demand.empty()) {
+                    unmet_supply.insert(d);
+                    sockets->freeze(d);
+                }
+                else {
+                    int other_descriptor = *(unmet_demand.begin());
+                    unmet_demand.erase(other_descriptor);
+                    supply_map[d] = other_descriptor;
+                    demand_map[other_descriptor] = d;
+                    sockets->unfreeze(other_descriptor);
+                }
+            }
+            else if (listener == demand_descriptor) {
+                if (unmet_supply.empty()) {
+                    unmet_demand.insert(d);
+                    sockets->freeze(d);
+                }
+                else {
+                    int other_descriptor = *(unmet_supply.begin());
+                    unmet_supply.erase(other_descriptor);
+                    demand_map[d] = other_descriptor;
+                    supply_map[other_descriptor] = d;
+                    sockets->unfreeze(other_descriptor);
+                }
+            }
+            else log("Forbidden condition met (%s:%d).", __FILE__, __LINE__);
+        }
+
+        while ((d = sockets->next_incoming()) != SOCKETS::NO_DESCRIPTOR) {
+            sockets->swap_incoming(d, buffer);
+
+            int forward_to = SOCKETS::NO_DESCRIPTOR;
+
+            if (supply_map.count(d)) {
+                forward_to = supply_map[d];
+            }
+            else if (demand_map.count(d)) {
+                forward_to = demand_map[d];
+            }
+
+            if (forward_to == SOCKETS::NO_DESCRIPTOR) {
+                log("Forbidden condition met (%s:%d).", __FILE__, __LINE__);
+            }
+            else {
+                log(
+                    "%lu byte%s from %s:%s %s sent to %s:%s.",
+                    buffer.size(), buffer.size() == 1 ? "" : "s",
+                    sockets->get_host(d), sockets->get_port(d),
+                    buffer.size() == 1 ? "is" : "are",
+                    sockets->get_host(forward_to), sockets->get_port(forward_to)
+                );
+
+                sockets->append_outgoing(forward_to, buffer);
+            }
+
+            buffer.clear();
         }
     }
     while (!terminated);

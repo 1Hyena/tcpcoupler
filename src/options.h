@@ -94,7 +94,7 @@ class OPTIONS {
                     break;
                 }
                 case 'v':
-                    log(nullptr, "%s\n", version);
+                    log(nullptr, "%s\n", version.c_str());
                     exit_flag = 1;
                     break;
                 case '?':

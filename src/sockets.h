@@ -13,21 +13,25 @@ class SOCKETS {
     static const int NO_DESCRIPTOR = -1;
 
     enum class FLAG : uint8_t {
-        NONE      = 0,
-        EPOLL     = 1,
-        READ      = 2,
-        WRITE     = 3,
-        ACCEPT    = 4,
-        CONNECT   = 5,
-        DISCONNECT= 6,
-        CLOSE     = 7,
-        MAX_FLAGS = 8
+        NONE      =  0,
+        EPOLL     =  1,
+        READ      =  2,
+        WRITE     =  3,
+        ACCEPT    =  4,
+        CONNECT   =  5,
+        DISCONNECT=  6,
+        CLOSE     =  7,
+        INCOMING  =  8,
+        FROZEN    =  9,
+        MAX_FLAGS = 10
     };
 
     private:
     struct record_type {
         std::array<uint32_t, static_cast<size_t>(FLAG::MAX_FLAGS)> flags;
         epoll_event *events;
+        std::vector<uint8_t> *incoming;
+        std::vector<uint8_t> *outgoing;
         std::array<char, NI_MAXHOST> host;
         std::array<char, NI_MAXSERV> port;
         int descriptor;
@@ -46,6 +50,8 @@ class SOCKETS {
         record_type record{
             .flags      = {},
             .events     = nullptr,
+            .incoming   = nullptr,
+            .outgoing   = nullptr,
             .host       = {'\0'},
             .port       = {'\0'},
             .descriptor = descriptor,
@@ -191,6 +197,25 @@ class SOCKETS {
         return NO_DESCRIPTOR;
     }
 
+    inline int next_incoming() {
+        static constexpr const size_t flg_incoming_index{
+            static_cast<size_t>(FLAG::INCOMING)
+        };
+
+        if (!flags[flg_incoming_index].empty()) {
+            int descriptor = flags[flg_incoming_index].back().descriptor;
+            rem_flag(descriptor, FLAG::INCOMING);
+            return descriptor;
+        }
+
+        return NO_DESCRIPTOR;
+    }
+
+    inline int get_listener(int descriptor) const {
+        const record_type *record = find_record(descriptor);
+        return record ? record->parent : NO_DESCRIPTOR;
+    }
+
     inline const char *get_host(int descriptor) const {
         const record_type *record = find_record(descriptor);
         return record ? record->host.data() : "";
@@ -199,6 +224,65 @@ class SOCKETS {
     inline const char *get_port(int descriptor) const {
         const record_type *record = find_record(descriptor);
         return record ? record->port.data() : "";
+    }
+
+    inline void freeze(int descriptor) {
+        set_flag(descriptor, FLAG::FROZEN);
+    }
+
+    inline void unfreeze(int descriptor) {
+        if (!has_flag(descriptor, FLAG::DISCONNECT)
+        &&  !has_flag(descriptor, FLAG::CLOSE)) {
+            rem_flag(descriptor, FLAG::FROZEN);
+        }
+    }
+
+    inline bool is_frozen(int descriptor) {
+        return has_flag(descriptor, FLAG::FROZEN);
+    }
+
+    inline void disconnect(
+        int descriptor,
+        const char *file =__builtin_FILE(), int line =__builtin_LINE()
+    ) {
+        if (!has_flag(descriptor, FLAG::CLOSE)) {
+            set_flag(descriptor, FLAG::DISCONNECT);
+        }
+    }
+
+    inline bool swap_incoming(int descriptor, std::vector<uint8_t> &bytes) {
+        const record_type *record = find_record(descriptor);
+        if (record && record->incoming) record->incoming->swap(bytes);
+        else return false;
+
+        return true;
+    }
+
+    inline bool swap_outgoing(int descriptor, std::vector<uint8_t> &bytes) {
+        const record_type *record = find_record(descriptor);
+        if (record && record->outgoing) record->outgoing->swap(bytes);
+        else return false;
+
+        return true;
+    }
+
+    inline bool append_outgoing(
+        int descriptor, const std::vector<uint8_t> &bytes
+    ) {
+        const record_type *record = find_record(descriptor);
+
+        if (record && record->outgoing) {
+            if (!bytes.empty()) {
+                record->outgoing->insert(
+                    record->outgoing->end(), bytes.begin(), bytes.end()
+                );
+
+                set_flag(descriptor, FLAG::WRITE);
+            }
+        }
+        else return false;
+
+        return true;
     }
 
     inline bool serve(int descriptor, int timeout =0) {
@@ -248,6 +332,7 @@ class SOCKETS {
                         if (handle_epoll(d, timeout)) continue;
                         break;
                     }
+                    case FLAG::INCOMING:
                     case FLAG::CONNECT:
                     case FLAG::DISCONNECT: {
                         // This descriptor has been marked for acknoledgement
@@ -256,12 +341,21 @@ class SOCKETS {
                         set_flag(d, flag);
                         continue;
                     }
-                    case FLAG::CLOSE: {
-                        if (has_flag(d, FLAG::READ)) {
-                            // We postpone normal closing until there is nothing
-                            // left to read from this descriptor.
+                    case FLAG::FROZEN: {
+                        // This flag has no handler. Only the application can
+                        // unfreeze this descriptor.
 
-                            set_flag(d, FLAG::READ);
+                        set_flag(d, flag);
+                        continue;
+                    }
+                    case FLAG::CLOSE: {
+                        if (has_flag(d, FLAG::READ)
+                        && !has_flag(d, FLAG::FROZEN)) {
+                            // Unless this descriptor is frozen, we postpone
+                            // normal closing until there is nothing left to
+                            // read from this descriptor.
+
+                            set_flag(d, flag);
                             continue;
                         }
 
@@ -269,10 +363,11 @@ class SOCKETS {
                         break;
                     }
                     case FLAG::ACCEPT: {
-                        if (!flags[flg_disconnect_index].empty()) {
+                        if (!flags[flg_disconnect_index].empty()
+                        || has_flag(d, FLAG::FROZEN)) {
                             // We postpone the acceptance of new connections
                             // until all the recent disconnections have been
-                            // acknowledged.
+                            // acknowledged and the descriptor is not frozen.
 
                             set_flag(d, flag);
                             continue;
@@ -282,10 +377,20 @@ class SOCKETS {
                         break;
                     }
                     case FLAG::WRITE: {
+                        if (has_flag(d, FLAG::FROZEN)) {
+                            set_flag(d, flag);
+                            continue;
+                        }
+
                         if (handle_write(d)) continue;
                         break;
                     }
                     case FLAG::READ: {
+                        if (has_flag(d, FLAG::FROZEN)) {
+                            set_flag(d, flag);
+                            continue;
+                        }
+
                         if (handle_read(d)) continue;
                         break;
                     }
@@ -351,7 +456,7 @@ class SOCKETS {
 
             if ((  events[i].events & EPOLLERR )
             ||  (  events[i].events & EPOLLHUP )
-            ||  (!(events[i].events & EPOLLIN) )) {
+            ||  (!(events[i].events & (EPOLLIN|EPOLLOUT) ))) {
                 int socket_error = 0;
                 socklen_t socket_errlen = sizeof(socket_error);
 
@@ -400,7 +505,7 @@ class SOCKETS {
                     );
                 }
 
-                set_flag(d, FLAG::DISCONNECT);
+                disconnect(d);
 
                 continue;
             }
@@ -409,7 +514,10 @@ class SOCKETS {
                 set_flag(d, FLAG::ACCEPT);
             }
             else {
-                set_flag(d, FLAG::READ);
+                if (events[i].events & EPOLLIN)  set_flag(d, FLAG::READ);
+                if (events[i].events & EPOLLOUT) {
+                    set_flag(d, FLAG::WRITE);
+                }
             }
         }
 
@@ -417,6 +525,8 @@ class SOCKETS {
     }
 
     inline bool handle_read(int descriptor) {
+        record_type *record = find_record(descriptor);
+
         while (1) {
             ssize_t count;
             char buf[65536];
@@ -453,45 +563,84 @@ class SOCKETS {
                 break;
             }
 
-            log(
-                logfrom.c_str(), "%lld bytes were read from descriptor %d",
-                (long long) count, descriptor
-            );
-
-            // Process buf here.
-
+            record->incoming->insert(record->incoming->end(), buf, buf+count);
             set_flag(descriptor, FLAG::READ);
+            set_flag(descriptor, FLAG::INCOMING);
 
             return true;
         }
 
-        set_flag(descriptor, FLAG::DISCONNECT);
+        disconnect(descriptor);
 
         return true;
     }
 
     inline bool handle_write(int descriptor) {
-        return true;
+        record_type *record = find_record(descriptor);
+
+        std::vector<uint8_t> *outgoing = record->outgoing;
+
+        if (outgoing->empty()) {
+            return true;
+        }
+
+        const unsigned char *bytes = &(outgoing->at(0));
+        size_t length = outgoing->size();
+
+        bool try_again_later = true;
+        size_t istart;
+        ssize_t nwrite;
+
+        for (istart = 0; istart<length; istart+=nwrite) {
+            size_t buf = length - istart;
+            size_t nblock = (buf < 4096 ? buf : 4096);
+
+            nwrite = write(descriptor, bytes+istart, nblock);
+
+            if (nwrite < 0) {
+                int code = errno;
+
+                if (code != EPIPE) {
+                    if (code == EAGAIN || code == EWOULDBLOCK) {
+                        // Let's start expecting EPOLLOUT.
+                        try_again_later = false;
+                    }
+                    else {
+                        log(
+                            logfrom.c_str(), "write: %s (%s:%d)",
+                            strerror(code), __FILE__, __LINE__
+                        );
+                    }
+                }
+
+                break;
+            }
+            else if (nwrite == 0) {
+                break;
+            }
+        }
+
+        if (istart == length) {
+            outgoing->clear();
+        }
+        else if (istart > 0) {
+            outgoing->erase(outgoing->begin(), outgoing->begin()+istart);
+
+            if (try_again_later) {
+                set_flag(descriptor, FLAG::WRITE);
+            }
+        }
+
+        if (try_again_later) {
+            return modify_epoll(descriptor, EPOLLIN|EPOLLET);
+        }
+
+        return modify_epoll(descriptor, EPOLLIN|EPOLLOUT|EPOLLET);
     }
 
     inline bool handle_accept(int descriptor) {
         // New incoming connection detected.
-        int epoll_descriptor = NO_DESCRIPTOR;
-        record_type *epoll_record = nullptr;
-
-        static constexpr const size_t flag_index{
-            static_cast<size_t>(FLAG::EPOLL)
-        };
-
-        for (size_t i=0, sz=flags[flag_index].size(); i<sz; ++i) {
-            epoll_descriptor = flags[flag_index][i].descriptor;
-            record_type *rec = find_record(epoll_descriptor);
-
-            if (rec->parent == descriptor) {
-                epoll_record = rec;
-                break;
-            }
-        }
+        record_type *epoll_record = find_epoll_record(descriptor);
 
         if (!epoll_record) {
             log(
@@ -501,6 +650,8 @@ class SOCKETS {
 
             return false;
         }
+
+        int epoll_descriptor = epoll_record->descriptor;
 
         struct sockaddr in_addr;
         socklen_t in_len = sizeof(in_addr);
@@ -587,6 +738,23 @@ class SOCKETS {
 
         record_type *client_record = find_record(client_descriptor);
 
+        client_record->incoming = new (std::nothrow) std::vector<uint8_t>;
+        client_record->outgoing = new (std::nothrow) std::vector<uint8_t>;
+
+        if (!client_record->incoming
+        ||  !client_record->outgoing) {
+            log(
+                logfrom.c_str(), "new: out of memory (%s:%d)",
+                __FILE__, __LINE__
+            );
+
+            if (!close_and_clear(client_descriptor)) {
+                pop(client_descriptor);
+            }
+
+            return false;
+        }
+
         int retval = getnameinfo(
             &in_addr, in_len,
             client_record->host.data(), socklen_t(client_record->host.size()),
@@ -634,9 +802,11 @@ class SOCKETS {
                 pop(client_descriptor);
             }
         }
+        else {
+            set_flag(client_descriptor, FLAG::CONNECT);
+        }
 
         set_flag(descriptor, FLAG::ACCEPT);
-        set_flag(client_descriptor, FLAG::CONNECT);
 
         return true;
     }
@@ -1056,10 +1226,13 @@ class SOCKETS {
                 rem_flag(rec.descriptor, static_cast<FLAG>(j));
             }
 
-            // Then, we free the events.
+            // Then, we free the dynamically allocated memory.
             if (rec.events) {
                 delete [] rec.events;
             }
+
+            if (rec.incoming) delete rec.incoming;
+            if (rec.outgoing) delete rec.outgoing;
 
             // Finally, we remove the record.
             descriptors[key_hash][i] = descriptors[key_hash].back();
@@ -1089,9 +1262,81 @@ class SOCKETS {
         );
     }
 
+    inline record_type *find_epoll_record(int descriptor) {
+        int listener{
+            is_listener(descriptor) ? descriptor : get_listener(descriptor)
+        };
+        int epoll_descriptor = NO_DESCRIPTOR;
+        record_type *epoll_record = nullptr;
+
+        static constexpr const size_t flag_index{
+            static_cast<size_t>(FLAG::EPOLL)
+        };
+
+        for (size_t i=0, sz=flags[flag_index].size(); i<sz; ++i) {
+            epoll_descriptor = flags[flag_index][i].descriptor;
+            record_type *rec = find_record(epoll_descriptor);
+
+            if (rec->parent == listener) {
+                epoll_record = rec;
+                break;
+            }
+        }
+
+        return epoll_record;
+    }
+
     inline bool is_listener(int descriptor) {
         record_type *rec = find_record(descriptor);
         return rec && rec->parent == NO_DESCRIPTOR;
+    }
+
+    bool modify_epoll(int descriptor, uint32_t events) {
+        record_type *epoll_record = find_epoll_record(descriptor);
+
+        if (!epoll_record) {
+            log(
+                logfrom.c_str(), "%s: %s (%s:%d)", __FUNCTION__,
+                "epoll record could not be found", __FILE__,
+                __LINE__
+            );
+
+            return false;
+        }
+
+        int epoll_descriptor = epoll_record->descriptor;
+
+        epoll_event *event = &(epoll_record->events[0]);
+
+        event->data.fd = descriptor;
+        event->events = events;
+
+        int retval = epoll_ctl(
+            epoll_descriptor, EPOLL_CTL_MOD, descriptor, event
+        );
+
+        if (retval != 0) {
+            if (retval == -1) {
+                int code = errno;
+
+                log(
+                    logfrom.c_str(),
+                    "epoll_ctl: %s (%s:%d)", strerror(code),
+                    __FILE__, __LINE__
+                );
+            }
+            else {
+                log(
+                    logfrom.c_str(),
+                    "epoll_ctl: unexpected return value %d "
+                    "(%s:%d)", retval, __FILE__, __LINE__
+                );
+            }
+
+            return false;
+        }
+
+        return true;
     }
 
     bool set_flag(int descriptor, FLAG flag) {
