@@ -1,5 +1,6 @@
-#ifndef TCPHERALD_H_01_01_2021
-#define TCPHERALD_H_01_01_2021
+// SPDX-License-Identifier: MIT
+#ifndef OPTIONS_H_01_01_2021
+#define OPTIONS_H_01_01_2021
 
 #include <string>
 #include <limits>

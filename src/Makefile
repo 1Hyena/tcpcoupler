@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 NAME    = tcpherald
 CC      = g++
 PROF    = -O3

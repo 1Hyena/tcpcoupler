@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef SOCKETS_H_02_01_2021
 #define SOCKETS_H_02_01_2021
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef SIGNALS_H_01_01_2021
 #define SIGNALS_H_01_01_2021
 
