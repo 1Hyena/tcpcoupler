@@ -37,6 +37,14 @@ void PROGRAM::run() {
         sockets->listen(std::to_string(get_demand_port()).c_str())
     };
 
+    int driver_descriptor = SOCKETS::NO_DESCRIPTOR;
+
+    if (get_driver_port()) {
+        driver_descriptor = sockets->listen(
+            std::to_string(get_driver_port()).c_str()
+        );
+    }
+
     if (supply_descriptor == SOCKETS::NO_DESCRIPTOR
     ||  demand_descriptor == SOCKETS::NO_DESCRIPTOR) {
         terminated = true;
@@ -46,10 +54,19 @@ void PROGRAM::run() {
         status = EXIT_SUCCESS;
         log_time = true;
 
-        log(
-            "Listening on ports %d and %d...",
-            int(get_supply_port()), int(get_demand_port())
-        );
+        if (driver_descriptor == SOCKETS::NO_DESCRIPTOR) {
+            log(
+                "Listening on ports %d and %d...",
+                int(get_supply_port()), int(get_demand_port())
+            );
+        }
+        else {
+            log(
+                "Listening on ports %d, %d and %d...",
+                int(get_supply_port()), int(get_demand_port()),
+                int(get_driver_port())
+            );
+        }
     }
 
     std::vector<uint8_t> buffer;
@@ -57,6 +74,7 @@ void PROGRAM::run() {
     std::unordered_map<int, int> demand_map;
     std::unordered_set<int> unmet_supply;
     std::unordered_set<int> unmet_demand;
+    std::unordered_set<int> drivers;
 
     do {
         signals->block();
@@ -85,6 +103,7 @@ void PROGRAM::run() {
         if (terminated) {
             sockets->disconnect(demand_descriptor);
             sockets->disconnect(supply_descriptor);
+            sockets->disconnect(driver_descriptor);
 
             continue;
         }
@@ -95,12 +114,19 @@ void PROGRAM::run() {
             terminated = true;
         }
 
+        size_t unmet_demand_before = unmet_demand.size();
+
         int d = SOCKETS::NO_DESCRIPTOR;
         while ((d = sockets->next_disconnection()) != SOCKETS::NO_DESCRIPTOR) {
             log(
                 "Disconnected %s:%s (descriptor %d).",
                 sockets->get_host(d), sockets->get_port(d), d
             );
+
+            if (drivers.count(d)) {
+                drivers.erase(d);
+                continue;
+            }
 
             int other_descriptor = SOCKETS::NO_DESCRIPTOR;
 
@@ -163,37 +189,50 @@ void PROGRAM::run() {
                     sockets->unfreeze(other_descriptor);
                 }
             }
+            else if (listener == driver_descriptor
+            && driver_descriptor != SOCKETS::NO_DESCRIPTOR) {
+                drivers.insert(d);
+                sockets->writef(d, "%lu\n", unmet_demand.size());
+            }
             else log("Forbidden condition met (%s:%d).", __FILE__, __LINE__);
+        }
+
+        if (unmet_demand.size() != unmet_demand_before) {
+            for (int driver : drivers) {
+                sockets->writef(driver, "%lu\n", unmet_demand.size());
+            }
         }
 
         while ((d = sockets->next_incoming()) != SOCKETS::NO_DESCRIPTOR) {
             sockets->swap_incoming(d, buffer);
 
-            int forward_to = SOCKETS::NO_DESCRIPTOR;
+            if (!drivers.count(d)) {
+                int forward_to = SOCKETS::NO_DESCRIPTOR;
 
-            if (supply_map.count(d)) {
-                forward_to = supply_map[d];
-            }
-            else if (demand_map.count(d)) {
-                forward_to = demand_map[d];
-            }
-
-            if (forward_to == SOCKETS::NO_DESCRIPTOR) {
-                log("Forbidden condition met (%s:%d).", __FILE__, __LINE__);
-            }
-            else {
-                if (is_verbose()) {
-                    log(
-                        "%lu byte%s from %s:%s %s sent to %s:%s.",
-                        buffer.size(), buffer.size() == 1 ? "" : "s",
-                        sockets->get_host(d), sockets->get_port(d),
-                        buffer.size() == 1 ? "is" : "are",
-                        sockets->get_host(forward_to),
-                        sockets->get_port(forward_to)
-                    );
+                if (supply_map.count(d)) {
+                    forward_to = supply_map[d];
+                }
+                else if (demand_map.count(d)) {
+                    forward_to = demand_map[d];
                 }
 
-                sockets->append_outgoing(forward_to, buffer);
+                if (forward_to == SOCKETS::NO_DESCRIPTOR) {
+                    log("Forbidden condition met (%s:%d).", __FILE__, __LINE__);
+                }
+                else {
+                    if (is_verbose()) {
+                        log(
+                            "%lu byte%s from %s:%s %s sent to %s:%s.",
+                            buffer.size(), buffer.size() == 1 ? "" : "s",
+                            sockets->get_host(d), sockets->get_port(d),
+                            buffer.size() == 1 ? "is" : "are",
+                            sockets->get_host(forward_to),
+                            sockets->get_port(forward_to)
+                        );
+                    }
+
+                    sockets->append_outgoing(forward_to, buffer);
+                }
             }
 
             buffer.clear();
@@ -392,6 +431,10 @@ uint16_t PROGRAM::get_supply_port() const {
 
 uint16_t PROGRAM::get_demand_port() const {
     return options->demand_port;
+}
+
+uint16_t PROGRAM::get_driver_port() const {
+    return options->driver_port;
 }
 
 bool PROGRAM::is_verbose() const {

@@ -247,6 +247,8 @@ class SOCKETS {
         int descriptor,
         const char *file =__builtin_FILE(), int line =__builtin_LINE()
     ) {
+        if (descriptor == NO_DESCRIPTOR) return;
+
         if (has_flag(descriptor, FLAG::CLOSE)
         ||  has_flag(descriptor, FLAG::DISCONNECT)) {
             return;
@@ -438,6 +440,79 @@ class SOCKETS {
         }
 
         return true;
+    }
+
+    inline void writef(
+        int descriptor, const char *fmt, ...
+    ) __attribute__((format(printf, 3, 4))) {
+        char stackbuf[1024];
+
+        va_list args;
+        va_start(args, fmt);
+        int retval = vsnprintf(stackbuf, sizeof(stackbuf), fmt, args);
+        va_end(args);
+
+        if (retval < 0) {
+            log(
+                logfrom.c_str(),
+                "%s: encoding error when formatting '%s' (%s:%d).",
+                __FUNCTION__, fmt, __FILE__, __LINE__
+            );
+
+            return;
+        }
+
+        const record_type *record = find_record(descriptor);
+
+        if (record && record->outgoing) {
+            if (size_t(retval) < sizeof(stackbuf)) {
+                record->outgoing->insert(
+                    record->outgoing->end(), stackbuf, stackbuf + retval
+                );
+                set_flag(descriptor, FLAG::WRITE);
+            }
+            else {
+                size_t heapbuf_sz = size_t(retval) + 1;
+                char *heapbuf = new (std::nothrow) char [heapbuf_sz];
+
+                if (heapbuf == nullptr) {
+                    log(
+                        logfrom.c_str(),
+                        "%s: out of memory when formatting '%s' (%s:%d).",
+                        __FUNCTION__, fmt, __FILE__, __LINE__
+                    );
+
+                    return;
+                }
+
+                va_start(args, fmt);
+                retval = vsnprintf(heapbuf, heapbuf_sz, fmt, args);
+                va_end(args);
+
+                if (retval < 0) {
+                    log(
+                        logfrom.c_str(),
+                        "%s: encoding error when formatting '%s' (%s:%d).",
+                        __FUNCTION__, fmt, __FILE__, __LINE__
+                    );
+                }
+                else if (size_t(retval) < heapbuf_sz) {
+                    record->outgoing->insert(
+                        record->outgoing->end(), heapbuf, heapbuf + retval
+                    );
+                    set_flag(descriptor, FLAG::WRITE);
+                }
+                else {
+                    log(
+                        logfrom.c_str(),
+                        "%s: unexpected program flow (%s:%d).",
+                        __FUNCTION__, __FILE__, __LINE__
+                    );
+                }
+
+                delete [] heapbuf;
+            }
+        }
     }
 
     private:

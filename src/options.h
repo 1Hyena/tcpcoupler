@@ -17,6 +17,7 @@ class OPTIONS {
       , exit_flag       (      0)
       , supply_port     (      0)
       , demand_port     (      0)
+      , driver_port     (      0)
       , name            (     "")
       , version         (version)
       , logfrom         (log_src)
@@ -28,6 +29,7 @@ class OPTIONS {
     int exit_flag;
     uint16_t supply_port;
     uint16_t demand_port;
+    uint16_t driver_port;
     std::string name;
 
     static constexpr const char *usage{
@@ -42,7 +44,8 @@ class OPTIONS {
         char line[256];
 
         std::snprintf(
-            line, sizeof(line), "Usage: %s [options] supply-port demand-port\n",
+            line, sizeof(line),
+            "Usage: %s [options] supply-port demand-port [driver-port]\n",
             name.c_str()
         );
 
@@ -147,6 +150,20 @@ class OPTIONS {
                 logfrom.c_str(), "%s", "missing argument: demand-port"
             );
             return false;
+        }
+
+        if (optind < argc) {
+            const char *port_str = argv[optind++];
+            int p = atoi(port_str);
+
+            if (p <= 0 || p > std::numeric_limits<uint16_t>::max()) {
+                log(
+                    logfrom.c_str(), "invalid port number: %s", port_str
+                );
+                return false;
+            }
+
+            driver_port = uint16_t(p);
         }
 
         while (optind < argc) {
