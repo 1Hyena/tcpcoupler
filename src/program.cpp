@@ -81,7 +81,12 @@ void PROGRAM::run() {
         }
         signals->unblock();
 
-        if (terminated) continue;
+        if (terminated) {
+            sockets->disconnect(demand_descriptor);
+            sockets->disconnect(supply_descriptor);
+
+            continue;
+        }
 
         if (!sockets->serve(supply_descriptor)
         ||  !sockets->serve(demand_descriptor, 125)) {

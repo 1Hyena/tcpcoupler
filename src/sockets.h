@@ -13,17 +13,18 @@ class SOCKETS {
     static const int NO_DESCRIPTOR = -1;
 
     enum class FLAG : uint8_t {
-        NONE      =  0,
-        EPOLL     =  1,
-        READ      =  2,
-        WRITE     =  3,
-        ACCEPT    =  4,
-        CONNECT   =  5,
-        DISCONNECT=  6,
-        CLOSE     =  7,
-        INCOMING  =  8,
-        FROZEN    =  9,
-        MAX_FLAGS = 10
+        NONE         =  0,
+        EPOLL        =  1,
+        READ         =  2,
+        WRITE        =  3,
+        ACCEPT       =  4,
+        CONNECT      =  5,
+        DISCONNECT   =  6,
+        CLOSE        =  7,
+        INCOMING     =  8,
+        FROZEN       =  9,
+        MAY_SHUTDOWN = 10,
+        MAX_FLAGS    = 11
     };
 
     private:
@@ -245,8 +246,46 @@ class SOCKETS {
         int descriptor,
         const char *file =__builtin_FILE(), int line =__builtin_LINE()
     ) {
-        if (!has_flag(descriptor, FLAG::CLOSE)) {
-            set_flag(descriptor, FLAG::DISCONNECT);
+        if (has_flag(descriptor, FLAG::CLOSE)
+        ||  has_flag(descriptor, FLAG::DISCONNECT)) {
+            return;
+        }
+
+        set_flag(descriptor, FLAG::DISCONNECT);
+
+        if (has_flag(descriptor, FLAG::MAY_SHUTDOWN)) {
+            rem_flag(descriptor, FLAG::MAY_SHUTDOWN);
+
+            int retval = shutdown(descriptor, SHUT_WR);
+            if (retval == -1) {
+                int code = errno;
+
+                log(
+                    logfrom.c_str(), "shutdown(%d, SHUT_WR): %s (%s:%d)",
+                    descriptor, strerror(code), file, line
+                );
+            }
+            else if (retval != 0) {
+                log(
+                    logfrom.c_str(),
+                    "shutdown(%d, SHUT_WR): unexpected return value of %d "
+                    "(%s:%d)", descriptor, retval, file, line
+                );
+            }
+        }
+
+        if (is_listener(descriptor)) {
+            for (size_t key=0; key<descriptors.size(); ++key) {
+                for (size_t i=0, sz=descriptors[key].size(); i<sz; ++i) {
+                    const record_type &rec = descriptors[key][i];
+
+                    if (rec.parent != descriptor) {
+                        continue;
+                    }
+
+                    disconnect(rec.descriptor, file, line);
+                }
+            }
         }
     }
 
@@ -312,6 +351,19 @@ class SOCKETS {
         for (size_t i=0; i<flags.size(); ++i) {
             FLAG flag = static_cast<FLAG>(i);
 
+            switch (flag) {
+                case FLAG::FROZEN:
+                case FLAG::INCOMING:
+                case FLAG::CONNECT:
+                case FLAG::DISCONNECT:
+                case FLAG::MAY_SHUTDOWN: {
+                    // This flag has no handler and is to be ignored here.
+
+                    continue;
+                }
+                default: break;
+            }
+
             recbuf.reserve(flags[i].size());
 
             for (size_t j=0, sz=flags[i].size(); j<sz; ++j) {
@@ -331,22 +383,6 @@ class SOCKETS {
                     case FLAG::EPOLL: {
                         if (handle_epoll(d, timeout)) continue;
                         break;
-                    }
-                    case FLAG::INCOMING:
-                    case FLAG::CONNECT:
-                    case FLAG::DISCONNECT: {
-                        // This descriptor has been marked for acknoledgement
-                        // but the application has not done it yet.
-
-                        set_flag(d, flag);
-                        continue;
-                    }
-                    case FLAG::FROZEN: {
-                        // This flag has no handler. Only the application can
-                        // unfreeze this descriptor.
-
-                        set_flag(d, flag);
-                        continue;
                     }
                     case FLAG::CLOSE: {
                         if (has_flag(d, FLAG::READ)
@@ -486,7 +522,8 @@ class SOCKETS {
                     else {
                         record_type *rec = find_record(d);
 
-                        if (socket_error != EPIPE
+                        if ((socket_error != EPIPE
+                          && socket_error != ECONNRESET)
                         ||  rec == nullptr
                         ||  rec->parent == NO_DESCRIPTOR) {
                             log(
@@ -497,14 +534,15 @@ class SOCKETS {
                         }
                     }
                 }
-                else {
+                else if ((events[i].events & EPOLLHUP) == false) {
                     log(
                         logfrom.c_str(),
-                        "unknown error on descriptor %d (%s:%d)", d,
-                        __FILE__, __LINE__
+                        "unexpected events %d on descriptor %d (%s:%d)",
+                        events[i].events, d, __FILE__, __LINE__
                     );
                 }
 
+                rem_flag(d, FLAG::MAY_SHUTDOWN);
                 disconnect(d);
 
                 continue;
@@ -570,6 +608,7 @@ class SOCKETS {
             return true;
         }
 
+        rem_flag(descriptor, FLAG::MAY_SHUTDOWN);
         disconnect(descriptor);
 
         return true;
@@ -804,6 +843,7 @@ class SOCKETS {
         }
         else {
             set_flag(client_descriptor, FLAG::CONNECT);
+            set_flag(client_descriptor, FLAG::MAY_SHUTDOWN);
         }
 
         set_flag(descriptor, FLAG::ACCEPT);
