@@ -324,7 +324,7 @@ class SOCKETS {
         return true;
     }
 
-    inline bool serve(int descriptor, int timeout =0) {
+    inline bool serve(int timeout =0) {
         static constexpr const size_t flg_connect_index{
             static_cast<size_t>(FLAG::CONNECT)
         };
@@ -368,10 +368,6 @@ class SOCKETS {
 
             for (size_t j=0, sz=flags[i].size(); j<sz; ++j) {
                 int d = flags[i][j].descriptor;
-                record_type *rec = find_record(d);
-
-                if (d != descriptor && rec->parent != descriptor) continue;
-
                 recbuf.emplace_back(d);
             }
 
@@ -679,7 +675,7 @@ class SOCKETS {
 
     inline bool handle_accept(int descriptor) {
         // New incoming connection detected.
-        record_type *epoll_record = find_epoll_record(descriptor);
+        record_type *epoll_record = find_epoll_record();
 
         if (!epoll_record) {
             log(
@@ -852,6 +848,25 @@ class SOCKETS {
     }
 
     inline int listen(const char *port, int family, int ai_flags =AI_PASSIVE) {
+        int epoll_descriptor = NO_DESCRIPTOR;
+        record_type *epoll_record = find_epoll_record();
+
+        if (!epoll_record) {
+            epoll_descriptor = create_epoll();
+
+            if (epoll_descriptor == NO_DESCRIPTOR) {
+                log(
+                    logfrom.c_str(), "%s: %s (%s:%d)", __FUNCTION__,
+                    "epoll record could not be created", __FILE__, __LINE__
+                );
+
+                return NO_DESCRIPTOR;
+            }
+        }
+        else {
+            epoll_descriptor = epoll_record->descriptor;
+        }
+
         int descriptor = create_and_bind(port, family, ai_flags);
 
         if (descriptor == NO_DESCRIPTOR) return NO_DESCRIPTOR;
@@ -881,9 +896,7 @@ class SOCKETS {
             return NO_DESCRIPTOR;
         }
 
-        int epoll_descriptor = create_epoll_and_bind(descriptor);
-
-        if (epoll_descriptor == NO_DESCRIPTOR) {
+        if (!bind_to_epoll(descriptor, epoll_descriptor)) {
             if (!close_and_clear(descriptor)) {
                 pop(descriptor);
             }
@@ -896,9 +909,7 @@ class SOCKETS {
         return descriptor;
     }
 
-    inline int create_epoll_and_bind(int descriptor) {
-        if (descriptor == NO_DESCRIPTOR) return NO_DESCRIPTOR;
-
+    inline int create_epoll() {
         int epoll_descriptor = epoll_create1(0);
 
         if (epoll_descriptor < 0) {
@@ -924,7 +935,7 @@ class SOCKETS {
         size_t descriptor_key = epoll_descriptor % descriptors.size();
 
         descriptors[descriptor_key].emplace_back(
-            make_record(epoll_descriptor, descriptor)
+            make_record(epoll_descriptor, NO_DESCRIPTOR)
         );
 
         record_type &record = descriptors[descriptor_key].back();
@@ -944,7 +955,16 @@ class SOCKETS {
             return NO_DESCRIPTOR;
         }
 
-        epoll_event *event = &(record.events[0]);
+        set_flag(epoll_descriptor, FLAG::EPOLL);
+
+        return epoll_descriptor;
+    }
+
+    inline bool bind_to_epoll(int descriptor, int epoll_descriptor) {
+        if (descriptor == NO_DESCRIPTOR) return NO_DESCRIPTOR;
+
+        record_type *record = find_record(epoll_descriptor);
+        epoll_event *event = &(record->events[0]);
 
         event->data.fd = descriptor;
         event->events = EPOLLIN|EPOLLET;
@@ -970,16 +990,10 @@ class SOCKETS {
                 );
             }
 
-            if (!close_and_clear(epoll_descriptor)) {
-                pop(epoll_descriptor);
-            }
-
-            return NO_DESCRIPTOR;
+            return false;
         }
 
-        set_flag(epoll_descriptor, FLAG::EPOLL);
-
-        return epoll_descriptor;
+        return true;
     }
 
     inline int create_and_bind(
@@ -1302,11 +1316,7 @@ class SOCKETS {
         );
     }
 
-    inline record_type *find_epoll_record(int descriptor) {
-        int listener{
-            is_listener(descriptor) ? descriptor : get_listener(descriptor)
-        };
-        int epoll_descriptor = NO_DESCRIPTOR;
+    inline record_type *find_epoll_record() {
         record_type *epoll_record = nullptr;
 
         static constexpr const size_t flag_index{
@@ -1314,10 +1324,10 @@ class SOCKETS {
         };
 
         for (size_t i=0, sz=flags[flag_index].size(); i<sz; ++i) {
-            epoll_descriptor = flags[flag_index][i].descriptor;
+            int epoll_descriptor = flags[flag_index][i].descriptor;
             record_type *rec = find_record(epoll_descriptor);
 
-            if (rec->parent == listener) {
+            if (rec) {
                 epoll_record = rec;
                 break;
             }
@@ -1328,11 +1338,14 @@ class SOCKETS {
 
     inline bool is_listener(int descriptor) {
         record_type *rec = find_record(descriptor);
-        return rec && rec->parent == NO_DESCRIPTOR;
+        return (
+            rec && rec->parent == NO_DESCRIPTOR &&
+            !has_flag(descriptor, FLAG::EPOLL)
+        );
     }
 
     bool modify_epoll(int descriptor, uint32_t events) {
-        record_type *epoll_record = find_epoll_record(descriptor);
+        record_type *epoll_record = find_epoll_record();
 
         if (!epoll_record) {
             log(

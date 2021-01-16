@@ -88,8 +88,7 @@ void PROGRAM::run() {
             continue;
         }
 
-        if (!sockets->serve(supply_descriptor)
-        ||  !sockets->serve(demand_descriptor, 125)) {
+        if (!sockets->serve()) {
             log("%s", "Error while serving the listening descriptors.");
             status = EXIT_FAILURE;
             terminated = true;
