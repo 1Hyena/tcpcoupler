@@ -38,6 +38,7 @@ class PROGRAM {
     const char *get_version() const;
     uint16_t get_supply_port() const;
     uint16_t get_demand_port() const;
+    bool is_verbose() const;
 
     private:
     static bool print_text(FILE *fp, const char *text, size_t length);

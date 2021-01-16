@@ -182,13 +182,16 @@ void PROGRAM::run() {
                 log("Forbidden condition met (%s:%d).", __FILE__, __LINE__);
             }
             else {
-                log(
-                    "%lu byte%s from %s:%s %s sent to %s:%s.",
-                    buffer.size(), buffer.size() == 1 ? "" : "s",
-                    sockets->get_host(d), sockets->get_port(d),
-                    buffer.size() == 1 ? "is" : "are",
-                    sockets->get_host(forward_to), sockets->get_port(forward_to)
-                );
+                if (is_verbose()) {
+                    log(
+                        "%lu byte%s from %s:%s %s sent to %s:%s.",
+                        buffer.size(), buffer.size() == 1 ? "" : "s",
+                        sockets->get_host(d), sockets->get_port(d),
+                        buffer.size() == 1 ? "is" : "are",
+                        sockets->get_host(forward_to),
+                        sockets->get_port(forward_to)
+                    );
+                }
 
                 sockets->append_outgoing(forward_to, buffer);
             }
@@ -389,4 +392,8 @@ uint16_t PROGRAM::get_supply_port() const {
 
 uint16_t PROGRAM::get_demand_port() const {
     return options->demand_port;
+}
+
+bool PROGRAM::is_verbose() const {
+    return options->verbose;
 }
