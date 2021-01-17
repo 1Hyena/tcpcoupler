@@ -108,15 +108,7 @@ void PROGRAM::run() {
             continue;
         }
 
-        if (is_verbose()) {
-            log(
-                "Connections: %lu / %lu",
-                supply_map.size() + unmet_supply.size(),
-                demand_map.size() + unmet_demand.size()
-            );
-        }
-
-        if (!sockets->serve(250)) {
+        if (!sockets->serve()) {
             log("%s", "Error while serving the listening descriptors.");
             status = EXIT_FAILURE;
             terminated = true;
