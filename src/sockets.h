@@ -14,18 +14,20 @@ class SOCKETS {
     static const int NO_DESCRIPTOR = -1;
 
     enum class FLAG : uint8_t {
-        NONE         =  0,
-        EPOLL        =  1,
-        READ         =  2,
-        WRITE        =  3,
-        ACCEPT       =  4,
-        CONNECT      =  5,
-        DISCONNECT   =  6,
-        CLOSE        =  7,
-        INCOMING     =  8,
-        FROZEN       =  9,
-        MAY_SHUTDOWN = 10,
-        MAX_FLAGS    = 11
+        NONE           =  0,
+        EPOLL          =  1,
+        READ           =  2,
+        WRITE          =  3,
+        ACCEPT         =  4,
+        NEW_CONNECTION =  5,
+        DISCONNECT     =  6,
+        CLOSE          =  7,
+        INCOMING       =  8,
+        FROZEN         =  9,
+        MAY_SHUTDOWN   = 10,
+        LISTENER       = 11,
+        CONNECTING     = 12,
+        MAX_FLAGS      = 13
     };
 
     private:
@@ -60,7 +62,7 @@ class SOCKETS {
             .parent     = parent
         };
 
-        for (auto i = 0; i != record.flags.size(); ++i) {
+        for (size_t i = 0; i != record.flags.size(); ++i) {
             record.flags[i] = std::numeric_limits<uint32_t>::max();
         }
 
@@ -172,12 +174,12 @@ class SOCKETS {
 
     inline int next_connection() {
         static constexpr const size_t flg_connect_index{
-            static_cast<size_t>(FLAG::CONNECT)
+            static_cast<size_t>(FLAG::NEW_CONNECTION)
         };
 
         if (!flags[flg_connect_index].empty()) {
             int descriptor = flags[flg_connect_index].back().descriptor;
-            rem_flag(descriptor, FLAG::CONNECT);
+            rem_flag(descriptor, FLAG::NEW_CONNECTION);
             return descriptor;
         }
 
@@ -241,6 +243,75 @@ class SOCKETS {
 
     inline bool is_frozen(int descriptor) {
         return has_flag(descriptor, FLAG::FROZEN);
+    }
+
+    inline int connect(const char *host, const char *port) {
+        int epoll_descriptor = NO_DESCRIPTOR;
+        record_type *epoll_record = find_epoll_record();
+
+        if (!epoll_record) {
+            epoll_descriptor = create_epoll();
+
+            if (epoll_descriptor == NO_DESCRIPTOR) {
+                log(
+                    logfrom.c_str(), "%s: %s (%s:%d)", __FUNCTION__,
+                    "epoll record could not be created", __FILE__, __LINE__
+                );
+
+                return NO_DESCRIPTOR;
+            }
+        }
+        else {
+            epoll_descriptor = epoll_record->descriptor;
+        }
+
+        std::vector<uint8_t> *incoming{new (std::nothrow) std::vector<uint8_t>};
+        std::vector<uint8_t> *outgoing{new (std::nothrow) std::vector<uint8_t>};
+
+        if (!incoming || !outgoing) {
+            log(
+                logfrom.c_str(), "new: out of memory (%s:%d)",
+                __FILE__, __LINE__
+            );
+
+            if (incoming) delete incoming;
+            if (outgoing) delete outgoing;
+
+            return NO_DESCRIPTOR;
+        }
+
+        int descriptor = create_and_bind(host, port, AF_UNSPEC, AI_PASSIVE);
+
+        if (descriptor == NO_DESCRIPTOR) {
+            delete incoming;
+            delete outgoing;
+            return NO_DESCRIPTOR;
+        }
+
+        record_type *record = find_record(descriptor);
+
+        record->incoming = incoming;
+        record->outgoing = outgoing;
+
+        strncpy(record->host.data(), host, record->host.size()-1);
+        strncpy(record->port.data(), port, record->port.size()-1);
+        record->host.back() = '\0';
+        record->port.back() = '\0';
+
+        if (!bind_to_epoll(descriptor, epoll_descriptor)) {
+            if (!close_and_clear(descriptor)) {
+                pop(descriptor);
+            }
+
+            return NO_DESCRIPTOR;
+        }
+
+        if (has_flag(descriptor, FLAG::CONNECTING)) {
+            modify_epoll(descriptor, EPOLLIN|EPOLLOUT|EPOLLET);
+        }
+        else set_flag(descriptor, FLAG::MAY_SHUTDOWN);
+
+        return descriptor;
     }
 
     inline void disconnect(
@@ -329,7 +400,7 @@ class SOCKETS {
 
     inline bool serve(int timeout =0) {
         static constexpr const size_t flg_connect_index{
-            static_cast<size_t>(FLAG::CONNECT)
+            static_cast<size_t>(FLAG::NEW_CONNECTION)
         };
 
         static constexpr const size_t flg_disconnect_index{
@@ -355,10 +426,12 @@ class SOCKETS {
             FLAG flag = static_cast<FLAG>(i);
 
             switch (flag) {
+                case FLAG::LISTENER:
                 case FLAG::FROZEN:
                 case FLAG::INCOMING:
-                case FLAG::CONNECT:
+                case FLAG::NEW_CONNECTION:
                 case FLAG::DISCONNECT:
+                case FLAG::CONNECTING:
                 case FLAG::MAY_SHUTDOWN: {
                     // This flag has no handler and is to be ignored here.
 
@@ -615,6 +688,7 @@ class SOCKETS {
                 }
 
                 rem_flag(d, FLAG::MAY_SHUTDOWN);
+                rem_flag(d, FLAG::CONNECTING);
                 disconnect(d);
 
                 continue;
@@ -624,7 +698,10 @@ class SOCKETS {
                 set_flag(d, FLAG::ACCEPT);
             }
             else {
-                if (events[i].events & EPOLLIN)  set_flag(d, FLAG::READ);
+                if (events[i].events & EPOLLIN) {
+                    set_flag(d, FLAG::READ);
+                }
+
                 if (events[i].events & EPOLLOUT) {
                     set_flag(d, FLAG::WRITE);
                 }
@@ -687,6 +764,12 @@ class SOCKETS {
     }
 
     inline bool handle_write(int descriptor) {
+        if (has_flag(descriptor, FLAG::CONNECTING)) {
+            set_flag(descriptor, FLAG::MAY_SHUTDOWN);
+            rem_flag(descriptor, FLAG::CONNECTING);
+            modify_epoll(descriptor, EPOLLIN|EPOLLET);
+        }
+
         record_type *record = find_record(descriptor);
 
         std::vector<uint8_t> *outgoing = record->outgoing;
@@ -914,7 +997,7 @@ class SOCKETS {
             }
         }
         else {
-            set_flag(client_descriptor, FLAG::CONNECT);
+            set_flag(client_descriptor, FLAG::NEW_CONNECTION);
             set_flag(client_descriptor, FLAG::MAY_SHUTDOWN);
         }
 
@@ -943,7 +1026,7 @@ class SOCKETS {
             epoll_descriptor = epoll_record->descriptor;
         }
 
-        int descriptor = create_and_bind(port, family, ai_flags);
+        int descriptor = create_and_bind(nullptr, port, family, ai_flags);
 
         if (descriptor == NO_DESCRIPTOR) return NO_DESCRIPTOR;
 
@@ -981,6 +1064,7 @@ class SOCKETS {
         }
 
         set_flag(descriptor, FLAG::ACCEPT);
+        set_flag(descriptor, FLAG::LISTENER);
 
         return descriptor;
     }
@@ -1073,7 +1157,7 @@ class SOCKETS {
     }
 
     inline int create_and_bind(
-        const char *port, int family, int ai_flags =AI_PASSIVE
+        const char *host, const char *port, int family, int ai_flags =AI_PASSIVE
     ) {
         struct addrinfo hint =
 #if __cplusplus <= 201703L
@@ -1092,7 +1176,7 @@ class SOCKETS {
         struct addrinfo *info = nullptr;
 
         int descriptor = NO_DESCRIPTOR;
-        int retval = getaddrinfo(nullptr, port, &hint, &info);
+        int retval = getaddrinfo(host, port, &hint, &info);
 
         if (retval != 0) {
             log(
@@ -1150,7 +1234,7 @@ class SOCKETS {
                     );
                 }
             }
-            else {
+            else if (host == nullptr) {
                 retval = bind(descriptor, next->ai_addr, next->ai_addrlen);
 
                 if (retval) {
@@ -1172,6 +1256,76 @@ class SOCKETS {
                     }
                 }
                 else break;
+            }
+            else {
+                // Let's block all signals before calling connect because we
+                // don't want it to fail due to getting interrupted by a singal.
+
+                retval = sigprocmask(SIG_SETMASK, &sigset_all, &sigset_orig);
+                if (retval == -1) {
+                    int code = errno;
+                    log(
+                        logfrom.c_str(), "sigprocmask: %s (%s:%d)",
+                        strerror(code), __FILE__, __LINE__
+                    );
+                }
+                else if (retval) {
+                    log(
+                        logfrom.c_str(),
+                        "sigprocmask: unexpected return value %d (%s:%d)",
+                        retval, __FILE__, __LINE__
+                    );
+                }
+                else {
+                    bool success = false;
+
+                    retval = ::connect(
+                        descriptor, next->ai_addr, next->ai_addrlen
+                    );
+
+                    if (retval) {
+                        if (retval == -1) {
+                            int code = errno;
+
+                            if (code == EINPROGRESS) {
+                                success = true;
+                                set_flag(descriptor, FLAG::CONNECTING);
+                            }
+                            else {
+                                log(
+                                    logfrom.c_str(), "connect: %s (%s:%d)",
+                                    strerror(code), __FILE__, __LINE__
+                                );
+                            }
+                        }
+                        else {
+                            log(
+                                logfrom.c_str(),
+                                "connect(%d, ?, ?) returned %d (%s:%d)",
+                                descriptor, retval, __FILE__, __LINE__
+                            );
+                        }
+                    }
+                    else success = true;
+
+                    retval = sigprocmask(SIG_SETMASK, &sigset_orig, nullptr);
+                    if (retval == -1) {
+                        int code = errno;
+                        log(
+                            logfrom.c_str(), "sigprocmask: %s (%s:%d)",
+                            strerror(code), __FILE__, __LINE__
+                        );
+                    }
+                    else if (retval) {
+                        log(
+                            logfrom.c_str(),
+                            "sigprocmask: unexpected return value %d (%s:%d)",
+                            retval, __FILE__, __LINE__
+                        );
+                    }
+
+                    if (success) break;
+                }
             }
 
             if (!close_and_clear(descriptor)) {
@@ -1413,11 +1567,7 @@ class SOCKETS {
     }
 
     inline bool is_listener(int descriptor) {
-        record_type *rec = find_record(descriptor);
-        return (
-            rec && rec->parent == NO_DESCRIPTOR &&
-            !has_flag(descriptor, FLAG::EPOLL)
-        );
+        return has_flag(descriptor, FLAG::LISTENER);
     }
 
     bool modify_epoll(int descriptor, uint32_t events) {
