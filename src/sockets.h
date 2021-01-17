@@ -448,7 +448,19 @@ class SOCKETS {
                             continue;
                         }
 
-                        if (handle_close(d)) continue;
+                        if (handle_close(d)) {
+                            // If we were trying to connect to a server but the
+                            // attempt failed, then we must prevent the epoll
+                            // handler from waiting. It may very well be that no
+                            // event would ever be triggered, causing the epoll
+                            // handler to wait indefinitely. Instead, we should
+                            // immediately return the control back to the
+                            // caller.
+
+                            timeout = 0;
+                            continue;
+                        }
+
                         break;
                     }
                     case FLAG::ACCEPT: {
