@@ -9,7 +9,7 @@ connections waiting on the _demand_ port is sent to all clients connected to the
 _driver_ port.
 
 ```
-Usage: ../tcpherald [options] supply-port demand-port [driver-port]
+Usage: ./tcpherald [options] supply-port demand-port [driver-port]
 Options:
       --brief         Print brief information (default).
   -h  --help          Display this usage information.
