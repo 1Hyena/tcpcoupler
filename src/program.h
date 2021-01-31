@@ -39,7 +39,12 @@ class PROGRAM {
     uint16_t get_supply_port() const;
     uint16_t get_demand_port() const;
     uint16_t get_driver_port() const;
+    uint32_t get_idle_timeout() const;
+    uint32_t get_driver_period() const;
     bool is_verbose() const;
+
+    long long get_timestamp() const;
+    void set_timer(size_t usec);
 
     private:
     static bool print_text(FILE *fp, const char *text, size_t length);
@@ -53,6 +58,7 @@ class PROGRAM {
 
     static size_t log_size;
     static bool   log_time;
+    struct itimerval timer;
 };
 
 #endif

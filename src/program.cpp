@@ -3,6 +3,7 @@
 #include <stdarg.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <chrono>
 
 #include "options.h"
 #include "program.h"
@@ -70,18 +71,29 @@ void PROGRAM::run() {
     }
 
     std::vector<uint8_t> buffer;
+    std::unordered_map<int, long long> timestamp_map;
     std::unordered_map<int, int> supply_map;
     std::unordered_map<int, int> demand_map;
     std::unordered_set<int> unmet_supply;
     std::unordered_set<int> unmet_demand;
     std::unordered_set<int> drivers;
 
+    static constexpr const size_t USEC_PER_SEC = 1000000;
+    bool alarmed = false;
+    set_timer(USEC_PER_SEC);
+
     do {
+        alarmed = false;
+
         signals->block();
         while (int sig = signals->next()) {
             char *sig_name = strsignal(sig);
 
             switch (sig) {
+                case SIGALRM: {
+                    alarmed = true;
+                    break;
+                }
                 case SIGINT :
                 case SIGTERM:
                 case SIGQUIT: terminated = true; // fall through
@@ -98,6 +110,9 @@ void PROGRAM::run() {
                 }
             }
         }
+
+        if (alarmed) set_timer(USEC_PER_SEC);
+
         signals->unblock();
 
         if (terminated) {
@@ -108,13 +123,13 @@ void PROGRAM::run() {
             continue;
         }
 
-        if (!sockets->serve()) {
+        if (!alarmed && !sockets->serve()) {
             log("%s", "Error while serving the listening descriptors.");
             status = EXIT_FAILURE;
             terminated = true;
         }
 
-        size_t unmet_demand_before = unmet_demand.size();
+        long long timestamp = get_timestamp();
 
         int d = SOCKETS::NO_DESCRIPTOR;
         while ((d = sockets->next_disconnection()) != SOCKETS::NO_DESCRIPTOR) {
@@ -122,6 +137,10 @@ void PROGRAM::run() {
                 "Disconnected %s:%s (descriptor %d).",
                 sockets->get_host(d), sockets->get_port(d), d
             );
+
+            if (timestamp_map.count(d)) {
+                timestamp_map.erase(d);
+            }
 
             if (drivers.count(d)) {
                 drivers.erase(d);
@@ -155,11 +174,15 @@ void PROGRAM::run() {
             }
         }
 
+        size_t new_demand = 0;
+
         while ((d = sockets->next_connection()) != SOCKETS::NO_DESCRIPTOR) {
             log(
                 "New connection from %s:%s (descriptor %d).",
                 sockets->get_host(d), sockets->get_port(d), d
             );
+
+            timestamp_map[d] = timestamp;
 
             int listener = sockets->get_listener(d);
 
@@ -174,12 +197,14 @@ void PROGRAM::run() {
                     supply_map[d] = other_descriptor;
                     demand_map[other_descriptor] = d;
                     sockets->unfreeze(other_descriptor);
+                    timestamp_map[other_descriptor] = timestamp;
                 }
             }
             else if (listener == demand_descriptor) {
                 if (unmet_supply.empty()) {
                     unmet_demand.insert(d);
                     sockets->freeze(d);
+                    ++new_demand;
                 }
                 else {
                     int other_descriptor = *(unmet_supply.begin());
@@ -187,19 +212,48 @@ void PROGRAM::run() {
                     demand_map[d] = other_descriptor;
                     supply_map[other_descriptor] = d;
                     sockets->unfreeze(other_descriptor);
+                    timestamp_map[other_descriptor] = timestamp;
                 }
             }
             else if (listener == driver_descriptor
             && driver_descriptor != SOCKETS::NO_DESCRIPTOR) {
                 drivers.insert(d);
+
+                timestamp_map[d] = (
+                    // Kludge to skip reporting new demand to this driver.
+                    timestamp + 1LL
+                );
+
                 sockets->writef(d, "%lu\n", unmet_demand.size());
             }
             else log("Forbidden condition met (%s:%d).", __FILE__, __LINE__);
         }
 
-        if (unmet_demand.size() != unmet_demand_before) {
+        if (new_demand || alarmed) {
             for (int driver : drivers) {
-                sockets->writef(driver, "%lu\n", unmet_demand.size());
+                if (timestamp_map[driver] > timestamp) {
+                    // This is a brand new driver and thus it must have already
+                    // received the current number of unmet demand.
+
+                    timestamp_map[driver] = timestamp;
+                    continue;
+                }
+
+                if (!new_demand) {
+                    uint32_t driver_period = get_driver_period();
+
+                    if (!driver_period
+                    ||  timestamp - timestamp_map[driver] < driver_period) {
+                        continue;
+                    }
+
+                    sockets->writef(driver, "%lu\n", unmet_demand.size());
+                }
+                else {
+                    sockets->writef(driver, "%lu\n", new_demand);
+                }
+
+                timestamp_map[driver] = timestamp;
             }
         }
 
@@ -232,10 +286,22 @@ void PROGRAM::run() {
                     }
 
                     sockets->append_outgoing(forward_to, buffer);
+                    timestamp_map[forward_to] = timestamp;
                 }
             }
 
             buffer.clear();
+            timestamp_map[d] = timestamp;
+        }
+
+        uint32_t idle_timeout = get_idle_timeout();
+
+        if (idle_timeout > 0 && alarmed) {
+            for (const auto &p : timestamp_map) {
+                if (timestamp - p.second >= idle_timeout) {
+                    sockets->disconnect(p.first);
+                }
+            }
         }
     }
     while (!terminated);
@@ -439,4 +505,27 @@ uint16_t PROGRAM::get_driver_port() const {
 
 bool PROGRAM::is_verbose() const {
     return options->verbose;
+}
+
+uint32_t PROGRAM::get_idle_timeout() const {
+    return options->idle_timeout;
+}
+
+uint32_t PROGRAM::get_driver_period() const {
+    return options->driver_period;
+}
+
+void PROGRAM::set_timer(size_t usec) {
+    timer.it_value.tv_sec     = usec / 1000000;
+    timer.it_value.tv_usec    = usec % 1000000;
+    timer.it_interval.tv_sec  = 0;
+    timer.it_interval.tv_usec = 0;
+
+    setitimer(ITIMER_REAL, &timer, nullptr);
+}
+
+long long PROGRAM::get_timestamp() const {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
 }

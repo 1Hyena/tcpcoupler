@@ -18,6 +18,8 @@ class OPTIONS {
       , supply_port     (      0)
       , demand_port     (      0)
       , driver_port     (      0)
+      , idle_timeout    (     60)
+      , driver_period   (     30)
       , name            (     "")
       , version         (version)
       , logfrom         (log_src)
@@ -30,12 +32,16 @@ class OPTIONS {
     uint16_t supply_port;
     uint16_t demand_port;
     uint16_t driver_port;
+    uint32_t idle_timeout;
+    uint32_t driver_period;
     std::string name;
 
     static constexpr const char *usage{
         "Options:\n"
         "      --brief         Print brief information (default).\n"
         "  -h  --help          Display this usage information.\n"
+        "  -p  --period        Driver refresh period in seconds (30).\n"
+        "  -t  --timeout       Connection idle timeout in seconds (60).\n"
         "      --verbose       Print verbose information.\n"
         "  -v  --version       Show version information.\n"
     };
@@ -64,6 +70,8 @@ class OPTIONS {
                 {"brief",       no_argument,       &verbose,   0 },
                 {"verbose",     no_argument,       &verbose,   1 },
                 // These options may take an argument:
+                {"period",      required_argument, 0,        'p' },
+                {"timeout",     required_argument, 0,        't' },
                 {"help",        no_argument,       0,        'h' },
                 {"version",     no_argument,       0,        'v' },
                 {0,             0,                 0,          0 }
@@ -71,7 +79,7 @@ class OPTIONS {
 
             int option_index = 0;
             c = getopt_long(
-                argc, argv, "hv", long_options, &option_index
+                argc, argv, "p:t:hv", long_options, &option_index
             );
 
             if (c == -1) break; // End of command line parameters?
@@ -90,6 +98,30 @@ class OPTIONS {
                     }
 
                     log(logfrom.c_str(), buf.c_str());
+                    break;
+                }
+                case 'p': {
+                    int i = atoi(optarg);
+                    if ((i == 0 && (optarg[0] != '0' || optarg[1] != '\0'))
+                    ||  (i < 0)) {
+                        log(
+                            logfrom.c_str(), "invalid period: %s", optarg
+                        );
+                        return false;
+                    }
+                    else driver_period = uint32_t(i);
+                    break;
+                }
+                case 't': {
+                    int i = atoi(optarg);
+                    if ((i == 0 && (optarg[0] != '0' || optarg[1] != '\0'))
+                    ||  (i < 0)) {
+                        log(
+                            logfrom.c_str(), "invalid timeout: %s", optarg
+                        );
+                        return false;
+                    }
+                    else idle_timeout = uint32_t(i);
                     break;
                 }
                 case 'h': {
