@@ -299,7 +299,16 @@ void PROGRAM::run() {
         if (idle_timeout > 0 && alarmed) {
             for (const auto &p : timestamp_map) {
                 if (timestamp - p.second >= idle_timeout) {
-                    sockets->disconnect(p.first);
+                    int d = p.first;
+
+                    if (is_verbose()) {
+                        log(
+                            "Connection %s:%s has timed out (descriptor %d).",
+                            sockets->get_host(d), sockets->get_port(d), d
+                        );
+                    }
+
+                    sockets->disconnect(d);
                 }
             }
         }
