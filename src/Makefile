@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-NAME    = tcpherald
+NAME    = tcpcoupler
 CC      = g++
 PROF    = -O3
 C_FLAGS = -std=c++17 -Wall -Wextra -pedantic-errors -Wconversion \
@@ -25,7 +25,7 @@ make_dynamic: $(O_FILES)
 	@printf "\033[1;32m %s DONE!\033[0m\n" $(NAME)
 
 make_debug: PROF = -O0 -g -rdynamic
-make_debug: DEFINES = -DTCPHERALD_DEBUG
+make_debug: DEFINES = -DTCPCOUPLER_DEBUG
 make_debug: $(O_FILES)
 	@printf "\033[1;33mMaking \033[37m   ...."
 	$(CC) -o $(OUT) $(O_FILES) $(L_FLAGS)

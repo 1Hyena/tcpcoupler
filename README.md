@@ -1,11 +1,11 @@
-# TCP Herald v1.14
+# TCP Coupler v1.14
 This Linux program is a proxy server that joins together pairs of incoming TCP
 connections. It listens simultaneously on two ports (_supply_ and _demand_) and
 connects any new client on the _demand_ port with a client waiting on the
 _supply_ port.
 
 ```
-Usage: ./tcpherald [options] supply-port demand-port [driver-port]
+Usage: ./tcpcoupler [options] supply-port demand-port [driver-port]
 Options:
       --brief         Print brief information (default).
   -h  --help          Display this usage information.
@@ -21,7 +21,7 @@ connections waiting on the _demand_ port is sent to all clients connected to the
 _driver_ port.
 
 Below is given an example setup that makes use of the _driver-port_ parameter.
-Let's say a _tcpherald_ instance is running on the _remotehost_ domain, having
+Let's say a _tcpcoupler_ instance is running on the _remotehost_ domain, having
 port _5000_ for its _suppy-port_, port _6000_ for its _demand-port_ and port
 _7000_ for its _driver-port_. We now wish to provide some TCP service running on
 _localhost_ port _4000_ from the mentioned remote host. To do so, we utilize the
