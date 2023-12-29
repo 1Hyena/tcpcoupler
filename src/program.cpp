@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <chrono>
+#include <vector>
 
 #include "options.h"
 #include "program.h"
@@ -21,6 +22,12 @@ size_t PROGRAM::log_size = 0;
 bool   PROGRAM::log_time = false;
 
 void PROGRAM::run() {
+    static constexpr const char
+        *ansi_G = "\x1B[1;32m",
+        *ansi_R = "\x1B[1;31m",
+        *ansi_B = "\x1B[1;34m",
+        *ansi_x = "\x1B[0m";
+
     if (!options) return bug();
 
     if (options->exit_flag) {
@@ -28,26 +35,57 @@ void PROGRAM::run() {
         return;
     }
 
+    sockets->set_logger(
+        [](SOCKETS::SESSION session, const char *text) noexcept {
+            std::string line;
+            char time[20];
+
+            write_time(time, sizeof(time));
+            line.append(time).append(" :: ");
+
+            if (!session) {
+                line.append("Sockets: ");
+            }
+            else {
+                char buffer[20];
+                std::snprintf(buffer, 20, "#%06lx: ", session.id);
+                line.append(buffer);
+            }
+
+            const char *esc = "\x1B[0;31m";
+
+            switch (session.error) {
+                case SOCKETS::BAD_TIMING:    esc = "\x1B[1;33m"; break;
+                case SOCKETS::LIBRARY_ERROR: esc = "\x1B[1;31m"; break;
+                case SOCKETS::NO_ERROR:      esc = "\x1B[0;32m"; break;
+                default: break;
+            }
+
+            line.append(esc).append(text).append("\x1B[0m").append("\n");
+            print_text(stderr, line.c_str(), line.size());
+        }
+    );
+
     bool terminated = false;
 
-    int supply_descriptor{
+    SOCKETS::SESSION supply_session{
         sockets->listen(std::to_string(get_supply_port()).c_str())
     };
 
-    int demand_descriptor{
+    SOCKETS::SESSION demand_session{
         sockets->listen(std::to_string(get_demand_port()).c_str())
     };
 
-    int driver_descriptor = SOCKETS::NO_DESCRIPTOR;
+    SOCKETS::SESSION driver_session{};
 
     if (get_driver_port()) {
-        driver_descriptor = sockets->listen(
+        driver_session = sockets->listen(
             std::to_string(get_driver_port()).c_str()
         );
     }
 
-    if (supply_descriptor == SOCKETS::NO_DESCRIPTOR
-    ||  demand_descriptor == SOCKETS::NO_DESCRIPTOR) {
+    if (!supply_session
+    ||  !demand_session) {
         terminated = true;
         status = EXIT_FAILURE;
     }
@@ -55,7 +93,7 @@ void PROGRAM::run() {
         status = EXIT_SUCCESS;
         log_time = true;
 
-        if (driver_descriptor == SOCKETS::NO_DESCRIPTOR) {
+        if (!driver_session) {
             log(
                 "Listening on ports %d and %d...",
                 int(get_supply_port()), int(get_demand_port())
@@ -70,13 +108,12 @@ void PROGRAM::run() {
         }
     }
 
-    std::vector<uint8_t> buffer;
-    std::unordered_map<int, long long> timestamp_map;
-    std::unordered_map<int, int> supply_map;
-    std::unordered_map<int, int> demand_map;
-    std::unordered_set<int> unmet_supply;
-    std::unordered_set<int> unmet_demand;
-    std::unordered_set<int> drivers;
+    std::unordered_map<size_t, long long> timestamp_map;
+    std::unordered_map<size_t, size_t> supply_map;
+    std::unordered_map<size_t, size_t> demand_map;
+    std::unordered_set<size_t> unmet_supply;
+    std::unordered_set<size_t> unmet_demand;
+    std::unordered_set<size_t> drivers;
 
     static constexpr const size_t USEC_PER_SEC = 1000000;
     bool alarmed = false;
@@ -96,7 +133,10 @@ void PROGRAM::run() {
                 }
                 case SIGINT :
                 case SIGTERM:
-                case SIGQUIT: terminated = true; // fall through
+                case SIGQUIT: {
+                    terminated = true;
+                    [[fallthrough]];
+                }
                 default     : {
                     // Since signals are blocked, we can call fprintf here.
                     fprintf(stderr, "%s", "\n");
@@ -116,121 +156,199 @@ void PROGRAM::run() {
         signals->unblock();
 
         if (terminated) {
-            sockets->disconnect(demand_descriptor);
-            sockets->disconnect(supply_descriptor);
-            sockets->disconnect(driver_descriptor);
+            sockets->disconnect(demand_session.id);
+            sockets->disconnect(supply_session.id);
+            sockets->disconnect(driver_session.id);
 
             continue;
         }
 
-        if (!alarmed && !sockets->serve()) {
-            log("%s", "Error while serving the listening descriptors.");
+        if (!alarmed && sockets->next_error() != SOCKETS::NO_ERROR) {
+            log("Sockets: %s", sockets->to_string(sockets->last_error()));
             status = EXIT_FAILURE;
             terminated = true;
         }
 
         long long timestamp = get_timestamp();
-
-        int d = SOCKETS::NO_DESCRIPTOR;
-        while ((d = sockets->next_disconnection()) != SOCKETS::NO_DESCRIPTOR) {
-            log(
-                "Disconnected %s:%s (descriptor %d).",
-                sockets->get_host(d), sockets->get_port(d), d
-            );
-
-            if (timestamp_map.count(d)) {
-                timestamp_map.erase(d);
-            }
-
-            if (drivers.count(d)) {
-                drivers.erase(d);
-                continue;
-            }
-
-            int other_descriptor = SOCKETS::NO_DESCRIPTOR;
-
-            if (supply_map.count(d)) {
-                other_descriptor = supply_map[d];
-                supply_map.erase(d);
-            }
-            else if (demand_map.count(d)) {
-                other_descriptor = demand_map[d];
-                demand_map.erase(d);
-            }
-            else {
-                unmet_supply.erase(d);
-                unmet_demand.erase(d);
-            }
-
-            if (other_descriptor != SOCKETS::NO_DESCRIPTOR) {
-                if (supply_map.count(other_descriptor)) {
-                    supply_map[other_descriptor] = SOCKETS::NO_DESCRIPTOR;
-                }
-                else if (demand_map.count(other_descriptor)) {
-                    demand_map[other_descriptor] = SOCKETS::NO_DESCRIPTOR;
-                }
-
-                sockets->disconnect(other_descriptor);
-            }
-        }
-
         size_t new_demand = 0;
+        SOCKETS::ALERT alert;
 
-        while ((d = sockets->next_connection()) != SOCKETS::NO_DESCRIPTOR) {
-            log(
-                "New connection from %s:%s (descriptor %d).",
-                sockets->get_host(d), sockets->get_port(d), d
-            );
+        while ((alert = sockets->next_alert()).valid) {
+            const size_t sid = alert.session;
+            size_t other = 0;
 
-            timestamp_map[d] = timestamp;
-
-            int listener = sockets->get_listener(d);
-
-            if (listener == supply_descriptor) {
-                if (unmet_demand.empty()) {
-                    unmet_supply.insert(d);
-                    sockets->freeze(d);
-                }
-                else {
-                    int other_descriptor = *(unmet_demand.begin());
-                    unmet_demand.erase(other_descriptor);
-                    supply_map[d] = other_descriptor;
-                    demand_map[other_descriptor] = d;
-                    sockets->unfreeze(other_descriptor);
-                    timestamp_map[other_descriptor] = timestamp;
-                }
-            }
-            else if (listener == demand_descriptor) {
-                if (unmet_supply.empty()) {
-                    unmet_demand.insert(d);
-                    sockets->freeze(d);
-                    ++new_demand;
-                }
-                else {
-                    int other_descriptor = *(unmet_supply.begin());
-                    unmet_supply.erase(other_descriptor);
-                    demand_map[d] = other_descriptor;
-                    supply_map[other_descriptor] = d;
-                    sockets->unfreeze(other_descriptor);
-                    timestamp_map[other_descriptor] = timestamp;
-                }
-            }
-            else if (listener == driver_descriptor
-            && driver_descriptor != SOCKETS::NO_DESCRIPTOR) {
-                drivers.insert(d);
-
-                timestamp_map[d] = (
-                    // Kludge to skip reporting new demand to this driver.
-                    timestamp + 1LL
+            if (alert.event == SOCKETS::DISCONNECTION) {
+                log(
+                    "Session %s#%06lx%s@%s:%s disconnected.",
+                    supply_map.count(sid) || unmet_supply.count(sid) ? ansi_G :
+                    demand_map.count(sid) || unmet_demand.count(sid) ? ansi_R :
+                    drivers.count(sid)    ? ansi_B : ansi_x,
+                    sid, ansi_x, sockets->get_host(sid), sockets->get_port(sid)
                 );
 
-                sockets->writef(d, "%lu\n", unmet_demand.size());
+                if (timestamp_map.count(sid)) {
+                    timestamp_map.erase(sid);
+                }
+
+                if (drivers.count(sid)) {
+                    drivers.erase(sid);
+                    continue;
+                }
+
+                if (supply_map.count(sid)) {
+                    other = supply_map[sid];
+                    supply_map.erase(sid);
+                }
+                else if (demand_map.count(sid)) {
+                    other = demand_map[sid];
+                    demand_map.erase(sid);
+                }
+                else {
+                    unmet_supply.erase(sid);
+                    unmet_demand.erase(sid);
+                }
+
+                if (other) {
+                    if (supply_map.count(other)) {
+                        supply_map[other] = 0;
+                    }
+                    else if (demand_map.count(other)) {
+                        demand_map[other] = 0;
+                    }
+
+                    sockets->disconnect(other);
+                }
             }
-            else log("Forbidden condition met (%s:%d).", __FILE__, __LINE__);
+            else if (alert.event == SOCKETS::CONNECTION) {
+                timestamp_map[sid] = timestamp;
+
+                SOCKETS::SESSION listener = sockets->get_listener(sid);
+
+                if (listener.id == supply_session.id) {
+                    if (unmet_demand.empty()) {
+                        unmet_supply.insert(sid);
+                        sockets->freeze(sid);
+                    }
+                    else {
+                        other = *(unmet_demand.begin());
+                        unmet_demand.erase(other);
+                        supply_map[sid] = other;
+                        demand_map[other] = sid;
+                        sockets->unfreeze(other);
+                        timestamp_map[other] = timestamp;
+                    }
+                }
+                else if (listener.id == demand_session.id) {
+                    if (unmet_supply.empty()) {
+                        unmet_demand.insert(sid);
+                        sockets->freeze(sid);
+                        ++new_demand;
+                    }
+                    else {
+                        other = *(unmet_supply.begin());
+                        unmet_supply.erase(other);
+                        demand_map[sid] = other;
+                        supply_map[other] = sid;
+                        sockets->unfreeze(other);
+                        timestamp_map[other] = timestamp;
+                    }
+                }
+                else if (listener.id == driver_session.id && !!driver_session) {
+                    drivers.insert(sid);
+
+                    timestamp_map[sid] = (
+                        // Kludge to skip reporting new demand to this driver.
+                        timestamp + 1LL
+                    );
+
+                    SOCKETS::ERROR error{
+                        sockets->writef(sid, "%lu\n", unmet_demand.size())
+                    };
+
+                    if (error != SOCKETS::NO_ERROR) {
+                        log(
+                            "%s (%s:%d)", sockets->to_string(error),
+                            __FILE__, __LINE__
+                        );
+                    }
+                }
+                else {
+                    log("Forbidden condition met (%s:%d).", __FILE__, __LINE__);
+                }
+
+                log(
+                    "Session %s#%06lx%s@%s:%s connected.",
+                    supply_map.count(sid) || unmet_supply.count(sid) ? ansi_G :
+                    demand_map.count(sid) || unmet_demand.count(sid) ? ansi_R :
+                    drivers.count(sid)    ? ansi_B : ansi_x,
+                    sid, ansi_x, sockets->get_host(sid), sockets->get_port(sid)
+                );
+            }
+            else if (alert.event == SOCKETS::INCOMING) {
+                if (!drivers.count(sid)) {
+                    size_t forward_to = 0;
+
+                    if (supply_map.count(sid)) {
+                        forward_to = supply_map[sid];
+                    }
+                    else if (demand_map.count(sid)) {
+                        forward_to = demand_map[sid];
+                    }
+
+                    if (!forward_to) {
+                        log(
+                            "Forbidden condition met (%s:%d).",
+                            __FILE__, __LINE__
+                        );
+                    }
+                    else {
+                        const size_t size = sockets->get_incoming_size(sid);
+                        const char *data = sockets->peek(sid);
+
+                        if (!sockets->write(forward_to, data, size)) {
+                            sockets->read(sid);
+                            timestamp_map[sid] = timestamp;
+                            timestamp_map[forward_to] = timestamp;
+
+                            if (is_verbose()) {
+                                log(
+                                    "%lu byte%s from %s#%06lx%s %s sent to "
+                                    "%s#%06lx%s.",
+                                    size, size == 1 ? "" : "s",
+                                    supply_map.count(sid) ? ansi_G : ansi_R,
+                                    sid, ansi_x,
+                                    size == 1 ? "is" : "are",
+                                    supply_map.count(forward_to) ? (
+                                        ansi_G
+                                    ) : ansi_R, forward_to, ansi_x
+                                );
+                            }
+                        }
+                        else {
+                            log(
+                                "Failed to send %lu byte%s from %s#%06lx%s to "
+                                "%s#%06lx%s.",
+                                size, size == 1 ? "" : "s",
+                                supply_map.count(sid) ? ansi_G : ansi_R, sid,
+                                ansi_x,
+                                supply_map.count(forward_to) ? ansi_G : ansi_R,
+                                forward_to, ansi_x
+                            );
+
+                            sockets->disconnect(forward_to);
+                            sockets->disconnect(sid);
+                        }
+                    }
+                }
+                else {
+                    sockets->read(sid);
+                    timestamp_map[sid] = timestamp;
+                }
+            }
         }
 
         if (new_demand || alarmed) {
-            for (int driver : drivers) {
+            for (size_t driver : drivers) {
                 if (timestamp_map[driver] > timestamp) {
                     // This is a brand new driver and thus it must have already
                     // received the current number of unmet demand.
@@ -247,51 +365,32 @@ void PROGRAM::run() {
                         continue;
                     }
 
-                    sockets->writef(driver, "%lu\n", unmet_demand.size());
+                    SOCKETS::ERROR error{
+                        sockets->writef(driver, "%lu\n", unmet_demand.size())
+                    };
+
+                    if (error != SOCKETS::NO_ERROR) {
+                        log(
+                            "%s (%s:%d)", sockets->to_string(error),
+                            __FILE__, __LINE__
+                        );
+                    }
                 }
                 else {
-                    sockets->writef(driver, "%lu\n", new_demand);
+                    SOCKETS::ERROR error{
+                        sockets->writef(driver, "%lu\n", new_demand)
+                    };
+
+                    if (error != SOCKETS::NO_ERROR) {
+                        log(
+                            "%s (%s:%d)", sockets->to_string(error),
+                            __FILE__, __LINE__
+                        );
+                    }
                 }
 
                 timestamp_map[driver] = timestamp;
             }
-        }
-
-        while ((d = sockets->next_incoming()) != SOCKETS::NO_DESCRIPTOR) {
-            sockets->swap_incoming(d, buffer);
-
-            if (!drivers.count(d)) {
-                int forward_to = SOCKETS::NO_DESCRIPTOR;
-
-                if (supply_map.count(d)) {
-                    forward_to = supply_map[d];
-                }
-                else if (demand_map.count(d)) {
-                    forward_to = demand_map[d];
-                }
-
-                if (forward_to == SOCKETS::NO_DESCRIPTOR) {
-                    log("Forbidden condition met (%s:%d).", __FILE__, __LINE__);
-                }
-                else {
-                    if (is_verbose()) {
-                        log(
-                            "%lu byte%s from %s:%s %s sent to %s:%s.",
-                            buffer.size(), buffer.size() == 1 ? "" : "s",
-                            sockets->get_host(d), sockets->get_port(d),
-                            buffer.size() == 1 ? "is" : "are",
-                            sockets->get_host(forward_to),
-                            sockets->get_port(forward_to)
-                        );
-                    }
-
-                    sockets->append_outgoing(forward_to, buffer);
-                    timestamp_map[forward_to] = timestamp;
-                }
-            }
-
-            buffer.clear();
-            timestamp_map[d] = timestamp;
         }
 
         uint32_t idle_timeout = get_idle_timeout();
@@ -299,16 +398,20 @@ void PROGRAM::run() {
         if (idle_timeout > 0 && alarmed) {
             for (const auto &p : timestamp_map) {
                 if (timestamp - p.second >= idle_timeout) {
-                    int d = p.first;
+                    size_t sid = p.first;
 
                     if (is_verbose()) {
                         log(
-                            "Connection %s:%s has timed out (descriptor %d).",
-                            sockets->get_host(d), sockets->get_port(d), d
+                            "Session %s#%06lx%s@%s:%s has timed out.",
+                            supply_map.count(sid) ? ansi_G :
+                            demand_map.count(sid) ? ansi_R :
+                            drivers.count(sid)    ? ansi_B : ansi_x,
+                            sid, ansi_x,
+                            sockets->get_host(sid), sockets->get_port(sid)
                         );
                     }
 
-                    sockets->disconnect(d);
+                    sockets->disconnect(sid);
                 }
             }
         }
@@ -336,11 +439,7 @@ bool PROGRAM::init(int argc, char **argv) {
     sockets = new (std::nothrow) SOCKETS();
     if (!sockets) return false;
 
-    return sockets->init(
-        [&](const char *txt) {
-            print_log("Sockets", "%s", txt);
-        }
-    );
+    return sockets->init();
 }
 
 int PROGRAM::deinit() {
@@ -373,6 +472,18 @@ int PROGRAM::get_status() const {
 
 size_t PROGRAM::get_log_size() {
     return PROGRAM::log_size;
+}
+
+void PROGRAM::write_time(char *buffer, size_t length) {
+    struct timeval timeofday;
+    gettimeofday(&timeofday, nullptr);
+
+    time_t timestamp = (time_t) timeofday.tv_sec;
+    struct tm *tm_ptr = gmtime(&timestamp);
+
+    if (!strftime(buffer, length, "%Y-%m-%d %H:%M:%S", tm_ptr)) {
+        buffer[0] = '\0';
+    }
 }
 
 bool PROGRAM::print_text(FILE *fp, const char *text, size_t len) {
